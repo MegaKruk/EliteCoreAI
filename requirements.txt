@@ -25,6 +25,7 @@ Pillow>=10.3.0              # used internally by ultralytics for image IO
 numpy>=1.26.0               # array math, used everywhere
 pyyaml>=6.0.1               # reading and writing data.yaml config files
 pandas>=2.2.0               # ultralytics uses it for results.csv parsing
+scikit-learn>=1.5.0         # KFold cross-validation split
 
 # --- visualization ---
 matplotlib>=3.9.0           # plotting training curves and label previews
