@@ -1,0 +1,39 @@
+# Elite Dangerous Core Mining Detector
+# Python 3.12.4 on Windows 11
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# PyTorch with CUDA 12.1 (for RTX 3070) must be installed first - pip can't
+# pick the right CUDA build automatically, so run this line manually BEFORE
+# running pip install -r requirements.txt:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# After that, the rest installs normally with the command above.
+
+# --- core ML ---
+ultralytics>=8.2.0          # YOLOv8 training + inference + export
+torch>=2.3.0                # installed separately with CUDA - see note above
+torchvision>=0.18.0         # installed separately with CUDA - see note above
+
+# --- image handling ---
+opencv-python>=4.9.0        # image loading, drawing bounding boxes, screen capture
+Pillow>=10.3.0              # used internally by ultralytics for image IO
+
+# --- data + config ---
+numpy>=1.26.0               # array math, used everywhere
+pyyaml>=6.0.1               # reading and writing data.yaml config files
+pandas>=2.2.0               # ultralytics uses it for results.csv parsing
+
+# --- visualization ---
+matplotlib>=3.9.0           # plotting training curves and label previews
+
+# --- notebook ---
+jupyterlab>=4.2.0           # run the .ipynb notebook
+ipywidgets>=8.1.0           # progress bars inside JupyterLab
+
+# --- export / inference runtime (optional but recommended) ---
+onnx>=1.16.0                # needed to export models to ONNX format
+onnxruntime-gpu>=1.18.0     # run ONNX models fast on GPU in the companion app
+                            # use onnxruntime (no -gpu) if you want CPU-only inference
