@@ -129,9 +129,27 @@ def capture_frame(sct, left, top, width, height):
     return np.array(raw)[:, :, :3]
 
 
-def draw_detections(frame, result, conf_threshold, debug=False):
+def prepare_for_inference(frame):
+    """
+    Resize frame to 640x640 using stretch (no letterbox, no padding).
+    This matches the Roboflow preprocessing used during training.
+    Ultralytics predict() on a numpy array uses letterbox by default, which
+    adds grey bars and mismatches training, hurting accuracy on wide frames.
+    Returns (resized_640, scale_x, scale_y) so coordinates can be mapped back.
+    """
+    H, W = frame.shape[:2]
+    resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
+    return resized, W / 640.0, H / 640.0
+
+
+def draw_detections(frame, result, conf_threshold, scale_xy=(1.0, 1.0), debug=False):
     """
     Draw segmentation polygon masks and confidence labels on a copy of frame.
+
+    scale_xy: (scale_x, scale_y) to map polygon coordinates from inference
+              space (640x640) back to the original frame dimensions. Pass the
+              values returned by prepare_for_inference().
+
     Returns (annotated_frame, n_drawn).
     """
     boxes = result.boxes
@@ -148,6 +166,7 @@ def draw_detections(frame, result, conf_threshold, debug=False):
     out     = frame.copy()
     overlay = frame.copy()
     n_drawn = 0
+    sx, sy  = scale_xy
 
     if masks is not None:
         for i in keep:
@@ -157,21 +176,14 @@ def draw_detections(frame, result, conf_threshold, debug=False):
             if len(pts) < 3:
                 continue
 
+            # scale from 640x640 inference space back to frame space
+            pts = (pts * np.array([[sx, sy]])).astype(np.int32)
+
             if debug:
                 print(f"  Detection {i}: conf={conf:.3f}, pts={len(pts)}, "
                       f"x=[{pts[:,0].min()}-{pts[:,0].max()}], "
                       f"y=[{pts[:,1].min()}-{pts[:,1].max()}], "
                       f"frame={W}x{H}")
-
-            # safety check: if coords are in inference space (640px) instead of
-            # frame space, scale them up. this should not happen with .pt models
-            # but is a known issue with some ONNX exports.
-            if pts[:,0].max() < 700 and W > 700:
-                sx = W / 640.0
-                sy = H / 640.0
-                pts = (pts * np.array([[sx, sy]])).astype(np.int32)
-                if debug:
-                    print(f"    Scaled coords by ({sx:.2f},{sy:.2f})")
 
             cv2.fillPoly(overlay, [pts], POLY_COLOR_BGR)
             cv2.polylines(out, [pts], isClosed=True, color=POLY_COLOR_BGR, thickness=3)
@@ -195,8 +207,11 @@ def draw_detections(frame, result, conf_threshold, debug=False):
     return blended, n_drawn
 
 
-def get_overlay_polygons(result, frame_shape, conf_threshold):
-    """Extract polygon data for tkinter canvas drawing."""
+def get_overlay_polygons(result, conf_threshold, scale_xy):
+    """
+    Extract polygon data for tkinter canvas drawing.
+    scale_xy: (scale_x, scale_y) from prepare_for_inference().
+    """
     boxes = result.boxes
     masks = result.masks
     out   = []
@@ -204,7 +219,7 @@ def get_overlay_polygons(result, frame_shape, conf_threshold):
     if boxes is None or masks is None or len(boxes) == 0:
         return out
 
-    H, W = frame_shape[:2]
+    sx, sy = scale_xy
 
     for box, mask_xy in zip(boxes, masks.xy):
         conf = float(box.conf)
@@ -215,9 +230,8 @@ def get_overlay_polygons(result, frame_shape, conf_threshold):
         if len(pts) < 3:
             continue
 
-        if pts[:,0].max() < 700 and W > 700:
-            pts = (pts * np.array([[W / 640.0, H / 640.0]])).astype(np.int32)
-
+        # scale from 640x640 inference space to frame/overlay space
+        pts  = (pts * np.array([[sx, sy]])).astype(np.int32)
         flat = pts.flatten().tolist()
         cx   = int(pts[:, 0].mean())
         cy   = int(pts[:, 1].mean())
@@ -237,7 +251,6 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
 
     left, top, cap_w, cap_h = capture_rect
     win_name  = f"Core Mining AI  [{ring_type}]"
-    # display at 960x540 by default - easy to resize manually
     disp_w, disp_h = 1080, 608
 
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -276,9 +289,10 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
         while True:
             t0 = time.perf_counter()
 
-            frame  = capture_frame(sct, left, top, cap_w, cap_h)
-            result = model.predict(frame, conf=conf, max_det=MAX_DET,
-                                   device="cpu", verbose=False)[0]
+            frame               = capture_frame(sct, left, top, cap_w, cap_h)
+            inf_input, sx, sy   = prepare_for_inference(frame)
+            result              = model.predict(inf_input, conf=conf, max_det=MAX_DET,
+                                                device="cpu", verbose=False)[0]
             inf_ms = (time.perf_counter() - t0) * 1000
 
             total_inf_ms += inf_ms
@@ -288,6 +302,7 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
 
             is_debug_frame = debug and frame_count % 10 == 0
             annotated, n_drawn = draw_detections(frame, result, conf,
+                                                 scale_xy=(sx, sy),
                                                  debug=is_debug_frame)
 
             if is_debug_frame:
@@ -358,12 +373,13 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
         with mss.mss() as sct:
             while running[0]:
                 t0     = time.perf_counter()
-                frame  = capture_frame(sct, left, top, w, h)
-                result = model.predict(frame, conf=conf, max_det=MAX_DET,
-                                       device="cpu", verbose=False)[0]
+                frame             = capture_frame(sct, left, top, w, h)
+                inf_input, sx, sy = prepare_for_inference(frame)
+                result            = model.predict(inf_input, conf=conf, max_det=MAX_DET,
+                                                  device="cpu", verbose=False)[0]
 
                 n_raw  = len(result.boxes) if result.boxes is not None else 0
-                polys  = get_overlay_polygons(result, frame.shape, conf)
+                polys  = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
                 latest_polys[0]  = polys
                 latest_n_raw[0]  = n_raw
                 frame_count[0]  += 1
@@ -374,7 +390,7 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
                           f"inf={inf_ms:.0f}ms")
 
                 if debug and debug_dir and frame_count[0] % 30 == 0 and len(polys) > 0:
-                    annotated, _ = draw_detections(frame, result, conf)
+                    annotated, _ = draw_detections(frame, result, conf, scale_xy=(sx, sy))
                     p = debug_dir / f"frame_{frame_count[0]:05d}_{len(polys)}cores.jpg"
                     cv2.imwrite(str(p), annotated)
                     print(f"  Saved: {p}")
@@ -388,7 +404,8 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
         if polys:
             for flat, conf_val, cx, cy in polys:
                 canvas.create_polygon(flat, outline=POLY_COLOR_HEX,
-                                      fill="", width=3)
+                                      fill=POLY_COLOR_HEX,
+                                      stipple="gray25", width=3)
                 label = f"core {conf_val:.2f}"
                 canvas.create_text(cx + 1, cy + 1, text=label,
                                    fill="#002200", font=("Consolas", 12, "bold"))
@@ -430,12 +447,12 @@ def main():
         help="Folder containing exported model files (default: exports)",
     )
     parser.add_argument(
-        "--conf", type=float, default=0.3,
-        help="Confidence threshold (default: 0.3). Start here and tune up/down.",
+        "--conf", type=float, default=0.35,
+        help="Confidence threshold (default: 0.35). Start here and tune up/down.",
     )
     parser.add_argument(
-        "--fps", type=int, default=30,
-        help="Target inference FPS (default: 30). The more, the bigger train on CPU.",
+        "--fps", type=int, default=15,
+        help="Target inference FPS (default: 5). 3-8 is practical on CPU.",
     )
     parser.add_argument(
         "--display", choices=["monitor2", "overlay"], default="monitor2",
@@ -494,20 +511,18 @@ def main():
         l, t, fw, fh = capture_rect
         test_frame  = capture_frame(sct, l, t, fw, fh)
 
-    test_result = model.predict(test_frame, conf=args.conf, max_det=MAX_DET,
+    test_input, tsx, tsy = prepare_for_inference(test_frame)
+    test_result = model.predict(test_input, conf=args.conf, max_det=MAX_DET,
                                 device="cpu", verbose=False)[0]
     n_test = len(test_result.boxes) if test_result.boxes else 0
-    print(f"Test frame: {fw}x{fh}, {n_test} detection(s) at conf>={args.conf}")
+    print(f"Test frame: {fw}x{fh} -> 640x640 stretch, {n_test} detection(s) at conf>={args.conf}")
 
     if test_result.masks is not None and n_test > 0:
-        pts = test_result.masks.xy[0].astype(np.int32)
+        pts = (test_result.masks.xy[0] * np.array([[tsx, tsy]])).astype(np.int32)
         print(f"First detection: {len(pts)} polygon points, "
               f"x=[{pts[:,0].min()}-{pts[:,0].max()}], "
               f"y=[{pts[:,1].min()}-{pts[:,1].max()}]")
-        if pts[:,0].max() < 700 and fw > 700:
-            print("Coord scaling will be applied (640->frame space).")
-        else:
-            print("Coordinates look correct.")
+        print("Coordinates scaled back to frame space.")
 
     print(f"\nRing type:  {args.ring_type}")
     print(f"Model:      {model_path}")
