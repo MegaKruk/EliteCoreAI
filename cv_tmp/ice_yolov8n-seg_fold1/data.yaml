@@ -1,0 +1,6 @@
+names:
+- core
+nc: 1
+path: C:\workspace\python\EliteCoreAI\cv_tmp\ice_yolov8n-seg_fold1
+train: images/train
+val: images/val
