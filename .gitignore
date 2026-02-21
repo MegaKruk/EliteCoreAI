@@ -152,3 +152,15 @@ tmp/
 # .idea
 .DS_Store
 .idea
+
+# cv_tmp
+cv_tmp/
+
+# runs
+runs/
+
+# exports
+exports/
+
+# model parameters tensors
+*.pt
