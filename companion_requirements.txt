@@ -1,0 +1,10 @@
+# Additional packages needed for companion_app.py
+# The core ML packages (ultralytics, opencv-python, onnxruntime-gpu) are
+# already installed from requirements.txt used during training.
+#
+# Install these with:
+#   pip install -r companion_requirements.txt
+
+mss>=9.0.1           # fast screen capture on Windows
+pygetwindow>=0.0.9   # find and locate the Elite Dangerous window
+screeninfo>=0.8.1    # detect second monitor position for auto window placement
