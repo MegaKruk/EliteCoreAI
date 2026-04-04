@@ -14,6 +14,7 @@ Usage:
     python companion_app.py --ring-type ice --conf 0.35
     python companion_app.py --ring-type ice --display overlay --conf 0.35
     python companion_app.py --ring-type ice --debug
+    python companion_app.py --ring-type metal_rich --model-path exports/metal_rich_yolo11_best.pt
 
 Controls:
     monitor2 mode: press Q in the display window to quit
@@ -447,6 +448,11 @@ def main():
         help="Folder containing exported model files (default: exports)",
     )
     parser.add_argument(
+        "--model-path", default=None,
+        help="Explicit path to a .pt model file. Overrides automatic lookup from "
+             "--models-dir. Example: exports/metal_rich_yolo11_best.pt",
+    )
+    parser.add_argument(
         "--conf", type=float, default=0.35,
         help="Confidence threshold (default: 0.35). Start here and tune up/down.",
     )
@@ -467,12 +473,19 @@ def main():
     args = parser.parse_args()
 
     # --- find model ---
-    model_path = find_model(args.ring_type, args.models_dir)
-    if model_path is None:
-        print(f"No model found for ring type '{args.ring_type}' in '{args.models_dir}'")
-        print("Expected: exports/<ring_type>_best.pt")
-        print("Run the export cell in the notebook, or check your models-dir path.")
-        sys.exit(1)
+    if args.model_path is not None:
+        model_path = Path(args.model_path)
+        if not model_path.exists():
+            print(f"Model file not found: {model_path}")
+            sys.exit(1)
+    else:
+        model_path = find_model(args.ring_type, args.models_dir)
+        if model_path is None:
+            print(f"No model found for ring type '{args.ring_type}' in '{args.models_dir}'")
+            print("Expected: exports/<ring_type>_best.pt")
+            print("Run the export cell in the notebook, or check your models-dir path.")
+            print("Or use --model-path to specify the exact .pt file.")
+            sys.exit(1)
 
     if model_path.suffix == ".onnx":
         print(f"WARNING: loading ONNX model {model_path}")
