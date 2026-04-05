@@ -2,8 +2,13 @@
 Elite Dangerous Core Mining AI Companion
 
 Captures the Elite Dangerous game window, runs segmentation inference on a
-locally hosted model (CPU only, GPU stays free for the game), and displays
-detected core asteroid polygon masks with confidence scores.
+locally hosted model, and displays detected core asteroid polygon masks with
+confidence scores.
+
+By default the model runs on GPU (CUDA) with FP16 for fast inference (~10ms
+per frame on RTX 3070). The nano/small YOLO models only use ~100-200MB VRAM
+which doesn't noticeably impact the game. Falls back to CPU if CUDA is not
+available (~200ms per frame on i5-12600KF).
 
 Two display modes:
   monitor2  - OpenCV window on your second monitor (always works, use this first)
@@ -16,6 +21,7 @@ Usage:
     python companion_app.py --ring-type ice --debug
     python companion_app.py --ring-type metal_rich --model-path exports/metal_rich_yolo11_best.pt
     python companion_app.py --ring-type ice --no-smoothing
+    python companion_app.py --ring-type ice --device cpu
 
 Controls:
     monitor2 mode: press Q in the display window to quit
@@ -26,7 +32,6 @@ NOTE on model format:
     models do not apply NMS properly when loaded via ultralytics, causing every
     frame to return exactly max_det=300 garbage detections. The .pt file works
     correctly and runs fine on CPU since ultralytics is already installed.
-    Inference speed on i5-12600KF: ~150ms per frame for yolov8s-seg (about 6fps).
 """
 
 import argparse
@@ -437,7 +442,8 @@ def get_overlay_polygons(result, conf_threshold, scale_xy):
     return out
 
 
-def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smoothing=True):
+def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
+                 smoothing=True, device="cpu", use_half=False):
     """
     Second-monitor display mode using an OpenCV window.
     The window is always shown at a sensible landscape size regardless of
@@ -478,8 +484,8 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smooth
     tracker = DetectionTracker(conf_threshold=conf) if smoothing else None
 
     # when smoothing, use the tracker's lower internal threshold for inference
-    # so the model returns more candidates (e.g. 0.85 when conf=0.90).
-    # the tracker's EMA + hysteresis handles the filtering from there.
+    # so the model returns more candidates for spatial tracking.
+    # the tracker's hit counting handles the display decision.
     inf_conf = tracker.internal_conf if tracker is not None else conf
 
     frame_count  = 0
@@ -498,13 +504,18 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smooth
         while True:
             t0 = time.perf_counter()
 
-            frame               = capture_frame(sct, left, top, cap_w, cap_h)
-            inf_input, sx, sy   = prepare_for_inference(frame)
-            result              = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
-                                                device="cpu", verbose=False)[0]
-            inf_ms = (time.perf_counter() - t0) * 1000
+            frame             = capture_frame(sct, left, top, cap_w, cap_h)
+            t_cap             = time.perf_counter()
+            inf_input, sx, sy = prepare_for_inference(frame)
+            result            = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
+                                              device=device, half=use_half,
+                                              verbose=False)[0]
+            t_inf             = time.perf_counter()
 
-            total_inf_ms += inf_ms
+            cap_ms = (t_cap - t0) * 1000
+            inf_ms = (t_inf - t_cap) * 1000
+            total_ms = (t_inf - t0) * 1000
+            total_inf_ms += total_ms
             frame_count  += 1
 
             n_raw = len(result.boxes) if result.boxes is not None else 0
@@ -530,7 +541,8 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smooth
                              f"age={tracker.frames_since_hit}, "
                              f"active={'Y' if tracker.active else 'N'}")
                 print(f"Frame {frame_count}: raw={n_raw}, drawn={n_drawn}, "
-                      f"inf={inf_ms:.0f}ms, avg={total_inf_ms/frame_count:.0f}ms"
+                      f"cap={cap_ms:.0f}ms, inf={inf_ms:.0f}ms, "
+                      f"avg={total_inf_ms/frame_count:.0f}ms"
                       f"{extra}")
                 if n_raw == MAX_DET:
                     print(f"  WARNING: hit max_det cap ({MAX_DET}). "
@@ -543,7 +555,7 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smooth
 
             cv2.setWindowTitle(win_name,
                 f"Core Mining AI  [{ring_type}]  |  "
-                f"{n_drawn} core(s)  |  {inf_ms:.0f}ms")
+                f"{n_drawn} core(s)  |  {total_ms:.0f}ms")
             cv2.imshow(win_name, annotated)
 
             elapsed = time.perf_counter() - t0
@@ -556,7 +568,8 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smooth
         print(f"\nStopped. Average inference: {total_inf_ms/frame_count:.0f}ms/frame")
 
 
-def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothing=True):
+def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
+                smoothing=True, device="cpu", use_half=False):
     """
     Transparent overlay mode using tkinter.
     Background color TRANSPARENT_HEX is made invisible by Windows compositor.
@@ -599,18 +612,22 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothi
 
     def inference_loop():
         import mss
-        frame_time = 1.0 / target_fps
         with mss.mss() as sct:
             while running[0]:
-                t0     = time.perf_counter()
-                frame             = capture_frame(sct, left, top, w, h)
+                t0 = time.perf_counter()
+                frame = capture_frame(sct, left, top, w, h)
+                t_cap = time.perf_counter()
                 inf_input, sx, sy = prepare_for_inference(frame)
-                result            = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
-                                                  device="cpu", verbose=False)[0]
+                result = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
+                                       device=device, half=use_half,
+                                       verbose=False)[0]
+                t_inf = time.perf_counter()
 
-                n_raw  = len(result.boxes) if result.boxes is not None else 0
-                frame_count[0]  += 1
-                inf_ms = (time.perf_counter() - t0) * 1000
+                n_raw = len(result.boxes) if result.boxes is not None else 0
+                frame_count[0] += 1
+                cap_ms = (t_cap - t0) * 1000
+                inf_ms = (t_inf - t_cap) * 1000
+                total_ms = (t_inf - t0) * 1000
 
                 is_debug_frame = debug and frame_count[0] % 10 == 0
 
@@ -630,8 +647,8 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothi
                 else:
                     polys = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
 
-                latest_polys[0]  = polys
-                latest_n_raw[0]  = n_raw
+                latest_polys[0] = polys
+                latest_n_raw[0] = n_raw
 
                 if is_debug_frame:
                     extra = ""
@@ -640,7 +657,8 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothi
                                  f"age={tracker.frames_since_hit}, "
                                  f"active={'Y' if tracker.active else 'N'}")
                     print(f"Frame {frame_count[0]}: raw={n_raw}, drawn={len(polys)}, "
-                          f"inf={inf_ms:.0f}ms{extra}")
+                          f"cap={cap_ms:.0f}ms, inf={inf_ms:.0f}ms, "
+                          f"total={total_ms:.0f}ms{extra}")
 
                 if debug and debug_dir and frame_count[0] % 30 == 0 and len(polys) > 0:
                     annotated, _ = draw_detections(frame, result, conf, scale_xy=(sx, sy))
@@ -648,7 +666,10 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothi
                     cv2.imwrite(str(p), annotated)
                     print(f"  Saved: {p}")
 
-                time.sleep(max(0.001, frame_time - inf_ms / 1000))
+    # canvas updates at a fixed 20fps regardless of inference speed.
+    # tkinter canvas operations hold the GIL and block the inference thread,
+    # so running them at 60fps causes massive contention and kills throughput.
+    CANVAS_INTERVAL_MS = 50  # 20fps
 
     def update_canvas():
         canvas.delete("all")
@@ -666,7 +687,7 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothi
                                    fill=POLY_COLOR_HEX, font=("Consolas", 12, "bold"))
 
         if running[0]:
-            root.after(int(1000 / target_fps), update_canvas)
+            root.after(CANVAS_INTERVAL_MS, update_canvas)
 
     def on_close():
         running[0] = False
@@ -714,8 +735,8 @@ def main():
         help="Confidence threshold (default: 0.35). Start here and tune up/down.",
     )
     parser.add_argument(
-        "--fps", type=int, default=15,
-        help="Target inference FPS (default: 5). 3-8 is practical on CPU.",
+        "--fps", type=int, default=30,
+        help="Target FPS (default: 30). GPU can sustain 30+, CPU tops out at 4-6.",
     )
     parser.add_argument(
         "--display", choices=["monitor2", "overlay"], default="monitor2",
@@ -724,12 +745,16 @@ def main():
         "--capture", choices=["game", "primary"], default="game",
     )
     parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="auto",
+        help="Inference device (default: auto). 'auto' uses GPU if available.",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Print detection details every 10 frames and save annotated frames.",
     )
     parser.add_argument(
         "--no-smoothing", action="store_true",
-        help="Disable EMA confidence smoothing and hysteresis. Shows raw detections "
+        help="Disable detection smoothing. Shows raw detections "
              "like the old behavior (bounding boxes blink on/off each frame).",
     )
     args = parser.parse_args()
@@ -758,12 +783,40 @@ def main():
     print(f"Loading: {model_path}")
     model = YOLO(str(model_path))
 
-    # warmup
-    dummy   = np.zeros((640, 640, 3), dtype=np.uint8)
-    warmup  = model.predict(dummy, conf=args.conf, max_det=MAX_DET,
-                             device="cpu", verbose=False)[0]
-    n_warm  = len(warmup.boxes) if warmup.boxes is not None else 0
-    print(f"Warmup: {n_warm} detections on blank frame (should be 0)")
+    # --- select inference device ---
+    import torch
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+
+    use_half = False
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA requested but not available. Falling back to CPU.")
+            device = "cpu"
+        else:
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_mb = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+            print(f"GPU: {gpu_name} ({vram_mb}MB VRAM)")
+            # FP16 (half precision) is ~2x faster on modern NVIDIA GPUs and
+            # uses half the VRAM. Safe for inference, no accuracy loss visible.
+            use_half = True
+            print(f"Device: {device} (FP16={'ON' if use_half else 'OFF'})")
+    else:
+        print(f"Device: {device}")
+
+    # warmup - first few inferences on GPU are slow due to CUDA kernel JIT
+    # compilation. run several iterations so the main loop doesn't stutter.
+    print("Warmup inference...", end=" ", flush=True)
+    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    n_warmup = 5 if device == "cuda" else 1
+    for i in range(n_warmup):
+        warmup = model.predict(dummy, conf=args.conf, max_det=MAX_DET,
+                               device=device, half=use_half, verbose=False)[0]
+    n_warm = len(warmup.boxes) if warmup.boxes is not None else 0
+    print(f"done ({n_warmup} iterations). "
+          f"{n_warm} detections on blank frame (should be 0)")
     if n_warm > 10:
         print("WARNING: too many detections on a blank frame.")
         print("If using .onnx, switch to .pt weights. If using .pt, retrain the model.")
@@ -788,7 +841,7 @@ def main():
 
     test_input, tsx, tsy = prepare_for_inference(test_frame)
     test_result = model.predict(test_input, conf=args.conf, max_det=MAX_DET,
-                                device="cpu", verbose=False)[0]
+                                device=device, half=use_half, verbose=False)[0]
     n_test = len(test_result.boxes) if test_result.boxes else 0
     print(f"Test frame: {fw}x{fh} -> 640x640 stretch, {n_test} detection(s) at conf>={args.conf}")
 
@@ -803,6 +856,7 @@ def main():
 
     print(f"\nRing type:  {args.ring_type}")
     print(f"Model:      {model_path}")
+    print(f"Device:     {device}" + (f" (FP16)" if use_half else ""))
     print(f"Confidence: {args.conf}")
     print(f"Target FPS: {args.fps}")
     print(f"Display:    {args.display}")
@@ -820,10 +874,10 @@ def main():
 
     if args.display == "overlay":
         run_overlay(model, capture_rect, args.conf, args.fps, args.ring_type,
-                    args.debug, smoothing=smoothing)
+                    args.debug, smoothing=smoothing, device=device, use_half=use_half)
     else:
         run_monitor2(model, capture_rect, args.conf, args.fps, args.ring_type,
-                     args.debug, smoothing=smoothing)
+                     args.debug, smoothing=smoothing, device=device, use_half=use_half)
 
 
 if __name__ == "__main__":
