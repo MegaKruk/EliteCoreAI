@@ -174,17 +174,17 @@ def create_dxcam_camera(capture_rect):
         return None
 
 
-def prepare_for_inference(frame):
+def prepare_for_inference(frame, imgsz=640):
     """
-    Resize frame to 640x640 using stretch (no letterbox, no padding).
+    Resize frame to imgsz x imgsz using stretch (no letterbox, no padding).
     This matches the Roboflow preprocessing used during training.
     Ultralytics predict() on a numpy array uses letterbox by default, which
     adds grey bars and mismatches training, hurting accuracy on wide frames.
-    Returns (resized_640, scale_x, scale_y) so coordinates can be mapped back.
+    Returns (resized, scale_x, scale_y) so coordinates can be mapped back.
     """
     H, W = frame.shape[:2]
-    resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
-    return resized, W / 640.0, H / 640.0
+    resized = cv2.resize(frame, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+    return resized, W / float(imgsz), H / float(imgsz)
 
 
 def extract_detections(result, conf_threshold, scale_xy):
@@ -477,7 +477,8 @@ def get_overlay_polygons(result, conf_threshold, scale_xy):
     return out
 
 
-def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
+def run_monitor2(model, capture_rect, crop_offset, imgsz,
+                 conf, target_fps, ring_type, debug,
                  smoothing=True, device="cpu", use_half=False):
     """
     Second-monitor display mode using an OpenCV window.
@@ -554,10 +555,10 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
                 frame = capture_frame(sct, left, top, cap_w, cap_h)
 
             t_cap             = time.perf_counter()
-            inf_input, sx, sy = prepare_for_inference(frame)
-            result            = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
-                                              device=device, half=use_half,
-                                              verbose=False)[0]
+            inf_input, sx, sy = prepare_for_inference(frame, imgsz=imgsz)
+            result            = model.predict(inf_input, imgsz=imgsz, conf=inf_conf,
+                                              max_det=MAX_DET, device=device,
+                                              half=use_half, verbose=False)[0]
             t_inf             = time.perf_counter()
 
             cap_ms = (t_cap - t0) * 1000
@@ -625,7 +626,8 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
         print(f"\nStopped. Average: {total_inf_ms/frame_count:.0f}ms/frame")
 
 
-def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
+def run_overlay(model, window_rect, capture_rect, crop_offset, imgsz,
+                conf, target_fps, ring_type, debug,
                 smoothing=True, device="cpu", use_half=False):
     """
     Transparent overlay mode using tkinter with a 3-thread pipeline:
@@ -633,26 +635,32 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
       Thread 2 (inference): runs YOLO on the latest frame, stores results
       Main thread (display): redraws tkinter canvas at 20fps from latest results
 
-    The capture and inference threads are decoupled so that a slow inference
-    (e.g. 200ms on CPU) doesn't stall screen capture. The display always has
-    a fresh frame position even if inference is still processing the previous one.
+    The overlay covers the full game window. If --crop-area is set, only the
+    center rectangle is captured and analyzed. Detections are offset from crop
+    space to window space for correct overlay positioning. A rectangle is drawn
+    on the overlay showing the active capture area.
 
     Elite Dangerous MUST be in BORDERLESS WINDOWED mode (game graphics settings).
     Ctrl+C in the terminal to quit.
     """
     import tkinter as tk
 
-    left, top, w, h = capture_rect
+    # overlay covers the full game window
+    wl, wt, ww, wh = window_rect
+    # capture area may be cropped (centered)
+    cl, ct, cw, ch = capture_rect
+    ox, oy = crop_offset
+    has_crop = (ox != 0 or oy != 0)
 
     root = tk.Tk()
     root.title("Core Mining AI Overlay")
-    root.geometry(f"{w}x{h}+{left}+{top}")
+    root.geometry(f"{ww}x{wh}+{wl}+{wt}")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.attributes("-transparentcolor", TRANSPARENT_HEX)
     root.configure(bg=TRANSPARENT_HEX)
 
-    canvas = tk.Canvas(root, width=w, height=h,
+    canvas = tk.Canvas(root, width=ww, height=wh,
                        bg=TRANSPARENT_HEX, highlightthickness=0)
     canvas.pack()
 
@@ -676,13 +684,13 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
     dxcam_camera = create_dxcam_camera(capture_rect)
 
     def capture_loop():
-        """Grabs screen frames and pre-resizes to 640x640 for inference."""
+        """Grabs screen frames from the capture area and resizes for inference."""
         if dxcam_camera is not None:
             # dxcam path: read from ring buffer (very fast, ~2-5ms)
             while running[0]:
                 frame = dxcam_camera.get_latest_frame()
                 if frame is not None:
-                    resized, sx, sy = prepare_for_inference(frame)
+                    resized, sx, sy = prepare_for_inference(frame, imgsz=imgsz)
                     latest_frame[0] = resized
                     latest_scale[0] = (sx, sy)
                     cap_count[0] += 1
@@ -693,8 +701,8 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
             import mss
             with mss.mss() as sct:
                 while running[0]:
-                    frame = capture_frame(sct, left, top, w, h)
-                    resized, sx, sy = prepare_for_inference(frame)
+                    frame = capture_frame(sct, cl, ct, cw, ch)
+                    resized, sx, sy = prepare_for_inference(frame, imgsz=imgsz)
                     latest_frame[0] = resized
                     latest_scale[0] = (sx, sy)
                     cap_count[0] += 1
@@ -715,7 +723,7 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
             sx, sy = latest_scale[0]
 
             t0 = time.perf_counter()
-            result = model.predict(frame, conf=inf_conf, max_det=MAX_DET,
+            result = model.predict(frame, imgsz=imgsz, conf=inf_conf, max_det=MAX_DET,
                                    device=device, half=use_half,
                                    verbose=False)[0]
             inf_ms = (time.perf_counter() - t0) * 1000
@@ -732,12 +740,22 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
                 polys = []
                 if visible:
                     for pts, raw_conf in to_draw:
-                        flat = pts.flatten().tolist()
-                        cx = int(pts[:, 0].mean())
-                        cy = int(pts[:, 1].mean())
+                        # offset from crop space to window space for overlay
+                        offset_pts = pts + np.array([[ox, oy]])
+                        flat = offset_pts.flatten().tolist()
+                        cx = int(offset_pts[:, 0].mean())
+                        cy = int(offset_pts[:, 1].mean())
                         polys.append((flat, best_conf, cx, cy))
             else:
-                polys = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
+                raw_polys = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
+                polys = []
+                for flat, conf_val, cx, cy in raw_polys:
+                    # offset flat coords (x0,y0,x1,y1,...) by crop offset
+                    coords = list(flat)
+                    for i in range(0, len(coords), 2):
+                        coords[i] += ox
+                        coords[i + 1] += oy
+                    polys.append((coords, conf_val, cx + ox, cy + oy))
 
             latest_polys[0] = polys
 
@@ -768,6 +786,12 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
 
     def update_canvas():
         canvas.delete("all")
+
+        # draw crop area rectangle if cropping is active
+        if has_crop:
+            canvas.create_rectangle(ox, oy, ox + cw, oy + ch,
+                                    outline="#FFAA00", width=2, dash=(6, 4))
+
         polys = latest_polys[0]
 
         if polys:
@@ -802,8 +826,8 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
     t_inf = threading.Thread(target=inference_loop, daemon=True)
     t_inf.start()
 
-    print(f"\nOverlay active: {w}x{h} at ({left},{top})")
-    print(f"Conf={conf}  Device={device}")
+    print(f"\nOverlay: {ww}x{wh} window, capturing {cw}x{ch}")
+    print(f"Img size: {imgsz}x{imgsz}  Device: {device}")
     if tracker is not None:
         print(f"Smoothing: ON  (internal_conf={inf_conf:.2f}, "
               f"min_hits={tracker.min_hits}, persist={tracker.persist_frames} frames)")
@@ -837,6 +861,19 @@ def main():
     parser.add_argument(
         "--conf", type=float, default=0.35,
         help="Confidence threshold (default: 0.35). Start here and tune up/down.",
+    )
+    parser.add_argument(
+        "--img-size", type=int, default=640,
+        help="Inference resolution (default: 640). Lower = faster but less detail. "
+             "Try 384 or 448 for ~2-3x speedup. Combine with --crop-area to "
+             "preserve detail in the center of the screen.",
+    )
+    parser.add_argument(
+        "--crop-area", default=None,
+        help="Capture only a centered rectangle instead of the full game window. "
+             "Format: WxH, e.g. --crop-area 1440x810. Reduces wasted pixels "
+             "at edges and preserves more detail when combined with --img-size. "
+             "A rectangle is drawn on the overlay/monitor2 showing the active area.",
     )
     parser.add_argument(
         "--fps", type=int, default=30,
@@ -981,13 +1018,15 @@ def main():
         else:
             print(f"Runtime: PyTorch, Device: {device}")
 
+    imgsz = args.img_size
+
     # warmup - first few inferences are slow due to JIT compilation.
-    # run several iterations so the main loop doesn't stutter.
+    # run several iterations at the target imgsz so the main loop doesn't stutter.
     print("Warmup inference...", end=" ", flush=True)
-    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
     n_warmup = 5 if device == "cuda" else 3
     for i in range(n_warmup):
-        warmup = model.predict(dummy, conf=args.conf, max_det=MAX_DET,
+        warmup = model.predict(dummy, imgsz=imgsz, conf=args.conf, max_det=MAX_DET,
                                device=device, half=use_half, verbose=False)[0]
     n_warm = len(warmup.boxes) if warmup.boxes is not None else 0
     print(f"done ({n_warmup} iterations). "
@@ -997,28 +1036,54 @@ def main():
         print("If using .onnx, switch to .pt weights. If using .pt, retrain the model.")
 
     # --- capture region ---
-    capture_rect = None
+    window_rect = None
     if args.capture == "game":
-        capture_rect = find_game_window()
-        if capture_rect is None:
+        window_rect = find_game_window()
+        if window_rect is None:
             print("Game window not found - falling back to primary monitor.")
 
-    if capture_rect is None:
-        capture_rect = get_primary_monitor_rect()
-        print(f"Capturing primary monitor: {capture_rect[2]}x{capture_rect[3]}")
+    if window_rect is None:
+        window_rect = get_primary_monitor_rect()
+        print(f"Capturing primary monitor: {window_rect[2]}x{window_rect[3]}")
+
+    # --- crop area ---
+    crop_offset = (0, 0)
+
+    if args.crop_area is not None:
+        try:
+            crop_w, crop_h = [int(x) for x in args.crop_area.lower().split("x")]
+        except ValueError:
+            print(f"Invalid --crop-area format: '{args.crop_area}'. Use WxH, e.g. 1440x810")
+            sys.exit(1)
+
+        wl, wt, ww, wh = window_rect
+        if crop_w > ww or crop_h > wh:
+            print(f"Crop area {crop_w}x{crop_h} is larger than window {ww}x{wh}")
+            sys.exit(1)
+
+        # center the crop rectangle in the window
+        cl = wl + (ww - crop_w) // 2
+        ct = wt + (wh - crop_h) // 2
+        capture_rect = (cl, ct, crop_w, crop_h)
+        # offset from window top-left to crop top-left (for overlay polygon positioning)
+        crop_offset = ((ww - crop_w) // 2, (wh - crop_h) // 2)
+        print(f"Crop area: {crop_w}x{crop_h} centered at offset ({crop_offset[0]},{crop_offset[1]})")
+    else:
+        capture_rect = window_rect
 
     # --- test inference ---
     print("\nRunning test capture...")
     import mss as _mss
     with _mss.mss() as sct:
         l, t, fw, fh = capture_rect
-        test_frame  = capture_frame(sct, l, t, fw, fh)
+        test_frame = capture_frame(sct, l, t, fw, fh)
 
-    test_input, tsx, tsy = prepare_for_inference(test_frame)
-    test_result = model.predict(test_input, conf=args.conf, max_det=MAX_DET,
+    test_input, tsx, tsy = prepare_for_inference(test_frame, imgsz=imgsz)
+    test_result = model.predict(test_input, imgsz=imgsz, conf=args.conf, max_det=MAX_DET,
                                 device=device, half=use_half, verbose=False)[0]
     n_test = len(test_result.boxes) if test_result.boxes else 0
-    print(f"Test frame: {fw}x{fh} -> 640x640 stretch, {n_test} detection(s) at conf>={args.conf}")
+    print(f"Test frame: {fw}x{fh} -> {imgsz}x{imgsz} stretch, "
+          f"{n_test} detection(s) at conf>={args.conf}")
 
     if test_result.masks is not None and n_test > 0:
         pts = (test_result.masks.xy[0] * np.array([[tsx, tsy]])).astype(np.int32)
@@ -1032,8 +1097,10 @@ def main():
     print(f"\nRing type:  {args.ring_type}")
     print(f"Model:      {model_path}")
     print(f"Runtime:    {args.runtime}" + (f", device={device}" if args.runtime == "pytorch" else ""))
+    print(f"Img size:   {imgsz}x{imgsz}")
+    if args.crop_area:
+        print(f"Crop area:  {args.crop_area} (centered)")
     print(f"Confidence: {args.conf}")
-    print(f"Target FPS: {args.fps}")
     print(f"Display:    {args.display}")
     print(f"Smoothing:  {'ON (persist + min_hits)' if smoothing else 'OFF (raw detections)'}")
     if smoothing:
@@ -1048,11 +1115,13 @@ def main():
             args.display = "monitor2"
 
     if args.display == "overlay":
-        run_overlay(model, capture_rect, args.conf, args.fps, args.ring_type,
-                    args.debug, smoothing=smoothing, device=device, use_half=use_half)
+        run_overlay(model, window_rect, capture_rect, crop_offset, imgsz,
+                    args.conf, args.fps, args.ring_type, args.debug,
+                    smoothing=smoothing, device=device, use_half=use_half)
     else:
-        run_monitor2(model, capture_rect, args.conf, args.fps, args.ring_type,
-                     args.debug, smoothing=smoothing, device=device, use_half=use_half)
+        run_monitor2(model, capture_rect, crop_offset, imgsz,
+                     args.conf, args.fps, args.ring_type, args.debug,
+                     smoothing=smoothing, device=device, use_half=use_half)
 
 
 if __name__ == "__main__":
