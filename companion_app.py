@@ -1,14 +1,22 @@
 """
 Elite Dangerous Core Mining AI Companion
 
-Captures the Elite Dangerous game window, runs segmentation inference on a
-locally hosted model, and displays detected core asteroid polygon masks with
-confidence scores.
+Captures the Elite Dangerous game window, runs segmentation inference, and
+displays detected core asteroid polygon masks with confidence scores.
 
-By default the model runs on GPU (CUDA) with FP16 for fast inference (~10ms
-per frame on RTX 3070). The nano/small YOLO models only use ~100-200MB VRAM
-which doesn't noticeably impact the game. Falls back to CPU if CUDA is not
-available (~200ms per frame on i5-12600KF).
+Uses CPU for inference by default. GPU (CUDA) is available via --device cuda
+but causes massive stalls (500-1500ms) when the game is rendering because
+torch.cuda.synchronize() blocks on ALL pending GPU work including the game's
+rendering pipeline. CPU inference is ~150-200ms per frame on an i5-12600KF,
+which is consistent and stall-free.
+
+Screen capture uses dxcam (DXGI Desktop Duplication API) if installed, which
+is ~3x faster than mss. Falls back to mss if dxcam is not available.
+Install: pip install dxcam
+
+Architecture: 3 threads for overlay mode, single-threaded for monitor2.
+  Overlay: capture thread -> latest_frame -> inference thread -> latest_polys
+           main thread reads latest_polys and redraws canvas at 20fps.
 
 Two display modes:
   monitor2  - OpenCV window on your second monitor (always works, use this first)
@@ -21,7 +29,7 @@ Usage:
     python companion_app.py --ring-type ice --debug
     python companion_app.py --ring-type metal_rich --model-path exports/metal_rich_yolo11_best.pt
     python companion_app.py --ring-type ice --no-smoothing
-    python companion_app.py --ring-type ice --device cpu
+    python companion_app.py --ring-type ice --device cuda
 
 Controls:
     monitor2 mode: press Q in the display window to quit
@@ -134,9 +142,34 @@ def get_monitor2_rect():
 
 
 def capture_frame(sct, left, top, width, height):
-    """Capture a screen region and return a BGR numpy array."""
+    """Capture a screen region and return a BGR numpy array. (mss backend)"""
     raw = sct.grab({"left": left, "top": top, "width": width, "height": height})
     return np.array(raw)[:, :, :3]
+
+
+def create_dxcam_camera(capture_rect):
+    """
+    Try to create a dxcam camera for fast screen capture via DXGI.
+    Returns the camera object or None if dxcam is not installed.
+    dxcam is ~3x faster than mss on Windows (5-10ms vs 30-40ms at 2560x1440).
+    """
+    try:
+        import dxcam
+        left, top, w, h = capture_rect
+        camera = dxcam.create(output_color="BGR")
+        # start continuous capture so grab() reads from an in-memory ring buffer
+        # instead of polling DXGI each time. region is (left, top, right, bottom).
+        region = (left, top, left + w, top + h)
+        camera.start(target_fps=60, video_mode=True, region=region)
+        print(f"Screen capture: dxcam (DXGI, ~5-10ms per frame)")
+        return camera
+    except ImportError:
+        print("Screen capture: mss (GDI, ~30-40ms per frame)")
+        print("For faster capture: pip install dxcam")
+        return None
+    except Exception as e:
+        print(f"dxcam init failed ({e}), falling back to mss")
+        return None
 
 
 def prepare_for_inference(frame):
@@ -450,7 +483,6 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
     whether the second monitor is portrait or landscape.
     Press Q to quit.
     """
-    import mss
 
     left, top, cap_w, cap_h = capture_rect
     win_name  = f"Core Mining AI  [{ring_type}]"
@@ -488,23 +520,37 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
     # the tracker's hit counting handles the display decision.
     inf_conf = tracker.internal_conf if tracker is not None else conf
 
+    # try dxcam for fast capture, fall back to mss
+    dxcam_camera = create_dxcam_camera(capture_rect)
+
     frame_count  = 0
     total_inf_ms = 0.0
     frame_time   = 1.0 / target_fps
 
     print(f"\nRunning. Press Q in the display window to quit.")
-    print(f"Conf={conf}  FPS target={target_fps}  Capture {cap_w}x{cap_h}")
+    print(f"Conf={conf}  Device={device}  Capture {cap_w}x{cap_h}")
     if tracker is not None:
         print(f"Smoothing: ON  (internal_conf={inf_conf:.2f}, "
               f"min_hits={tracker.min_hits}, persist={tracker.persist_frames} frames)")
     else:
         print(f"Smoothing: OFF")
 
-    with mss.mss() as sct:
+    # open mss as fallback (used if dxcam is not available)
+    import mss as _mss
+    sct = _mss.mss() if dxcam_camera is None else None
+
+    try:
         while True:
             t0 = time.perf_counter()
 
-            frame             = capture_frame(sct, left, top, cap_w, cap_h)
+            if dxcam_camera is not None:
+                frame = dxcam_camera.get_latest_frame()
+                if frame is None:
+                    time.sleep(0.001)
+                    continue
+            else:
+                frame = capture_frame(sct, left, top, cap_w, cap_h)
+
             t_cap             = time.perf_counter()
             inf_input, sx, sy = prepare_for_inference(frame)
             result            = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
@@ -563,17 +609,31 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug,
             if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
                 break
 
+    finally:
+        if dxcam_camera is not None:
+            try:
+                dxcam_camera.stop()
+            except Exception:
+                pass
+        if sct is not None:
+            sct.close()
+
     cv2.destroyAllWindows()
     if frame_count > 0:
-        print(f"\nStopped. Average inference: {total_inf_ms/frame_count:.0f}ms/frame")
+        print(f"\nStopped. Average: {total_inf_ms/frame_count:.0f}ms/frame")
 
 
 def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
                 smoothing=True, device="cpu", use_half=False):
     """
-    Transparent overlay mode using tkinter.
-    Background color TRANSPARENT_HEX is made invisible by Windows compositor.
-    Only polygon outlines and labels float over the game.
+    Transparent overlay mode using tkinter with a 3-thread pipeline:
+      Thread 1 (capture):   grabs screen frames as fast as possible
+      Thread 2 (inference): runs YOLO on the latest frame, stores results
+      Main thread (display): redraws tkinter canvas at 20fps from latest results
+
+    The capture and inference threads are decoupled so that a slow inference
+    (e.g. 200ms on CPU) doesn't stall screen capture. The display always has
+    a fresh frame position even if inference is still processing the previous one.
 
     Elite Dangerous MUST be in BORDERLESS WINDOWED mode (game graphics settings).
     Ctrl+C in the terminal to quit.
@@ -594,15 +654,15 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
                        bg=TRANSPARENT_HEX, highlightthickness=0)
     canvas.pack()
 
-    latest_polys = [None]
-    latest_n_raw = [0]
-    latest_conf = [0.0]
-    running      = [True]
-    frame_count  = [0]
+    # shared state between threads (GIL makes reference assignment atomic)
+    latest_frame = [None]       # set by capture thread, read by inference thread
+    latest_scale = [(1.0, 1.0)] # (sx, sy) from prepare_for_inference
+    latest_polys = [None]       # set by inference thread, read by display
+    running = [True]
+    cap_count = [0]
+    inf_count = [0]
 
     tracker = DetectionTracker(conf_threshold=conf) if smoothing else None
-
-    # when smoothing, use the tracker's lower internal threshold for inference
     inf_conf = tracker.internal_conf if tracker is not None else conf
 
     debug_dir = None
@@ -610,65 +670,98 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
         debug_dir = Path("debug_frames")
         debug_dir.mkdir(exist_ok=True)
 
-    def inference_loop():
-        import mss
-        with mss.mss() as sct:
+    # try dxcam for fast capture, fall back to mss
+    dxcam_camera = create_dxcam_camera(capture_rect)
+
+    def capture_loop():
+        """Grabs screen frames and pre-resizes to 640x640 for inference."""
+        if dxcam_camera is not None:
+            # dxcam path: read from ring buffer (very fast, ~2-5ms)
             while running[0]:
-                t0 = time.perf_counter()
-                frame = capture_frame(sct, left, top, w, h)
-                t_cap = time.perf_counter()
-                inf_input, sx, sy = prepare_for_inference(frame)
-                result = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
-                                       device=device, half=use_half,
-                                       verbose=False)[0]
-                t_inf = time.perf_counter()
-
-                n_raw = len(result.boxes) if result.boxes is not None else 0
-                frame_count[0] += 1
-                cap_ms = (t_cap - t0) * 1000
-                inf_ms = (t_inf - t_cap) * 1000
-                total_ms = (t_inf - t0) * 1000
-
-                is_debug_frame = debug and frame_count[0] % 10 == 0
-
-                if tracker is not None:
-                    detections = extract_detections(result, inf_conf, scale_xy=(sx, sy))
-                    visible, sm_conf, to_draw = tracker.update(detections,
-                                                               debug=is_debug_frame)
-                    latest_conf[0] = sm_conf
-                    # convert tracked detections to overlay polygon format
-                    polys = []
-                    if visible:
-                        for pts, raw_conf in to_draw:
-                            flat = pts.flatten().tolist()
-                            cx = int(pts[:, 0].mean())
-                            cy = int(pts[:, 1].mean())
-                            polys.append((flat, sm_conf, cx, cy))
+                frame = dxcam_camera.get_latest_frame()
+                if frame is not None:
+                    resized, sx, sy = prepare_for_inference(frame)
+                    latest_frame[0] = resized
+                    latest_scale[0] = (sx, sy)
+                    cap_count[0] += 1
                 else:
-                    polys = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
+                    time.sleep(0.001)
+        else:
+            # mss fallback: grab screen directly (~30-40ms)
+            import mss
+            with mss.mss() as sct:
+                while running[0]:
+                    frame = capture_frame(sct, left, top, w, h)
+                    resized, sx, sy = prepare_for_inference(frame)
+                    latest_frame[0] = resized
+                    latest_scale[0] = (sx, sy)
+                    cap_count[0] += 1
 
-                latest_polys[0] = polys
-                latest_n_raw[0] = n_raw
+    def inference_loop():
+        """Runs YOLO inference on whatever frame is latest."""
+        last_processed_cap = -1
 
-                if is_debug_frame:
-                    extra = ""
-                    if tracker is not None:
-                        extra = (f", hits={tracker.hit_count}, "
-                                 f"age={tracker.frames_since_hit}, "
-                                 f"active={'Y' if tracker.active else 'N'}")
-                    print(f"Frame {frame_count[0]}: raw={n_raw}, drawn={len(polys)}, "
-                          f"cap={cap_ms:.0f}ms, inf={inf_ms:.0f}ms, "
-                          f"total={total_ms:.0f}ms{extra}")
+        while running[0]:
+            frame = latest_frame[0]
+            current_cap = cap_count[0]
 
-                if debug and debug_dir and frame_count[0] % 30 == 0 and len(polys) > 0:
-                    annotated, _ = draw_detections(frame, result, conf, scale_xy=(sx, sy))
-                    p = debug_dir / f"frame_{frame_count[0]:05d}_{len(polys)}cores.jpg"
-                    cv2.imwrite(str(p), annotated)
-                    print(f"  Saved: {p}")
+            if frame is None or current_cap == last_processed_cap:
+                time.sleep(0.001)
+                continue
 
-    # canvas updates at a fixed 20fps regardless of inference speed.
-    # tkinter canvas operations hold the GIL and block the inference thread,
-    # so running them at 60fps causes massive contention and kills throughput.
+            last_processed_cap = current_cap
+            sx, sy = latest_scale[0]
+
+            t0 = time.perf_counter()
+            result = model.predict(frame, conf=inf_conf, max_det=MAX_DET,
+                                   device=device, half=use_half,
+                                   verbose=False)[0]
+            inf_ms = (time.perf_counter() - t0) * 1000
+
+            n_raw = len(result.boxes) if result.boxes is not None else 0
+            inf_count[0] += 1
+
+            is_debug_frame = debug and inf_count[0] % 10 == 0
+
+            if tracker is not None:
+                detections = extract_detections(result, inf_conf, scale_xy=(sx, sy))
+                visible, best_conf, to_draw = tracker.update(detections,
+                                                              debug=is_debug_frame)
+                polys = []
+                if visible:
+                    for pts, raw_conf in to_draw:
+                        flat = pts.flatten().tolist()
+                        cx = int(pts[:, 0].mean())
+                        cy = int(pts[:, 1].mean())
+                        polys.append((flat, best_conf, cx, cy))
+            else:
+                polys = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
+
+            latest_polys[0] = polys
+
+            if is_debug_frame:
+                extra = ""
+                if tracker is not None:
+                    extra = (f", hits={tracker.hit_count}, "
+                             f"age={tracker.frames_since_hit}, "
+                             f"active={'Y' if tracker.active else 'N'}")
+                print(f"Inf {inf_count[0]}: raw={n_raw}, drawn={len(polys)}, "
+                      f"inf={inf_ms:.0f}ms, caps={cap_count[0]}{extra}")
+
+            if debug and debug_dir and inf_count[0] % 30 == 0 and len(polys) > 0:
+                # for debug frame saving, we need a full-size frame.
+                # grab one from dxcam or skip if not available.
+                if dxcam_camera is not None:
+                    full_frame = dxcam_camera.get_latest_frame()
+                    if full_frame is not None:
+                        annotated, _ = draw_detections(full_frame, result, conf,
+                                                       scale_xy=(sx, sy))
+                        p = debug_dir / f"frame_{inf_count[0]:05d}_{len(polys)}cores.jpg"
+                        cv2.imwrite(str(p), annotated)
+                        print(f"  Saved: {p}")
+
+    # canvas updates at fixed 20fps. this is the display refresh rate.
+    # inference results appear on the next canvas update after they're ready.
     CANVAS_INTERVAL_MS = 50  # 20fps
 
     def update_canvas():
@@ -691,15 +784,24 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug,
 
     def on_close():
         running[0] = False
+        if dxcam_camera is not None:
+            try:
+                dxcam_camera.stop()
+            except Exception:
+                pass
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
 
-    t = threading.Thread(target=inference_loop, daemon=True)
-    t.start()
+    # start capture thread first, then inference thread
+    t_cap = threading.Thread(target=capture_loop, daemon=True)
+    t_cap.start()
+
+    t_inf = threading.Thread(target=inference_loop, daemon=True)
+    t_inf.start()
 
     print(f"\nOverlay active: {w}x{h} at ({left},{top})")
-    print(f"Conf={conf}  FPS={target_fps}")
+    print(f"Conf={conf}  Device={device}")
     if tracker is not None:
         print(f"Smoothing: ON  (internal_conf={inf_conf:.2f}, "
               f"min_hits={tracker.min_hits}, persist={tracker.persist_frames} frames)")
@@ -745,8 +847,9 @@ def main():
         "--capture", choices=["game", "primary"], default="game",
     )
     parser.add_argument(
-        "--device", choices=["auto", "cpu", "cuda"], default="auto",
-        help="Inference device (default: auto). 'auto' uses GPU if available.",
+        "--device", choices=["auto", "cpu", "cuda"], default="cpu",
+        help="Inference device (default: cpu). CPU is recommended because GPU "
+             "inference stalls when the game is rendering. Use 'cuda' to try GPU.",
     )
     parser.add_argument(
         "--debug", action="store_true",
