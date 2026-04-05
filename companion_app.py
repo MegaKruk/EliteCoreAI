@@ -15,6 +15,7 @@ Usage:
     python companion_app.py --ring-type ice --display overlay --conf 0.35
     python companion_app.py --ring-type ice --debug
     python companion_app.py --ring-type metal_rich --model-path exports/metal_rich_yolo11_best.pt
+    python companion_app.py --ring-type ice --no-smoothing
 
 Controls:
     monitor2 mode: press Q in the display window to quit
@@ -88,7 +89,10 @@ def find_game_window():
         import pygetwindow as gw
         wins = gw.getWindowsWithTitle(GAME_WINDOW_TITLE)
         if not wins:
-            wins = [w for w in gw.getAllWindows() if "elite" in w.title.lower()]
+            # fallback: match "elite" AND "dangerous" to avoid matching our own
+            # project windows like "EliteCoreAI - companion_app.py" in PyCharm
+            wins = [w for w in gw.getAllWindows()
+                    if "elite" in w.title.lower() and "dangerous" in w.title.lower()]
         if wins:
             w = wins[0]
             print(f"Found window: '{w.title}' at ({w.left},{w.top}) size {w.width}x{w.height}")
@@ -141,6 +145,198 @@ def prepare_for_inference(frame):
     H, W = frame.shape[:2]
     resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
     return resized, W / 640.0, H / 640.0
+
+
+def extract_detections(result, conf_threshold, scale_xy):
+    """
+    Pull all detections from a YOLO result into a flat list.
+    Each entry is (pts, conf, cx, cy) where pts is a scaled numpy polygon,
+    conf is the raw confidence, and (cx, cy) is the polygon centroid.
+    """
+    boxes = result.boxes
+    masks = result.masks
+    out = []
+
+    if boxes is None or masks is None or len(boxes) == 0:
+        return out
+
+    sx, sy = scale_xy
+
+    for box, mask_xy in zip(boxes, masks.xy):
+        conf = float(box.conf)
+        if conf < conf_threshold:
+            continue
+
+        pts = mask_xy.astype(np.int32)
+        if len(pts) < 3:
+            continue
+
+        pts = (pts * np.array([[sx, sy]])).astype(np.int32)
+        cx = int(pts[:, 0].mean())
+        cy = int(pts[:, 1].mean())
+        out.append((pts, conf, cx, cy))
+
+    return out
+
+
+class DetectionTracker:
+    """
+    Prevents bounding box flickering using the same approach as production
+    trackers (ByteTrack, SORT): frame counting with a persistence buffer.
+
+    Two counters control visibility:
+    - min_hits: how many strong detections (above --conf) at roughly the same
+      screen position before we start drawing. Prevents single-frame noise
+      from triggering display. Default 2 (~0.5s at 4fps).
+    - persist_frames: after the last strong detection, keep drawing the last
+      known polygon for this many frames. Bridges the detection gaps that
+      happen when the model misses every other frame. Default 8 (~2s at 4fps).
+      When the ship moves away and detections stop, the box disappears after
+      persist_frames with no ghost lingering.
+
+    The tracker also uses a lower internal_conf (conf * 0.4) for position
+    tracking: weak detections below --conf update the tracked centroid so
+    spatial matching stays accurate, but only strong detections (>= --conf)
+    count toward min_hits and reset the persistence timer.
+    """
+
+    def __init__(self, conf_threshold, min_hits=2, persist_frames=8,
+                 max_match_dist=400):
+        self.conf_threshold = conf_threshold
+        self.min_hits = min_hits
+        self.persist_frames = persist_frames
+        self.max_match_dist = max_match_dist
+        self.internal_conf = max(0.10, conf_threshold * 0.4)
+
+        self.hit_count = 0
+        self.frames_since_hit = 999
+        self.active = False
+        self.last_centroid = None
+        self.last_draw_list = []
+        self.last_best_conf = 0.0
+
+    def update(self, detections, debug=False):
+        """
+        Feed one frame's detections into the tracker.
+
+        detections: list of (pts, conf, cx, cy) from extract_detections().
+        Returns: (visible, best_conf, detections_to_draw)
+        """
+        # match detections near the tracked position
+        matched = []
+        for pts, conf, cx, cy in detections:
+            if self.last_centroid is not None:
+                dx = cx - self.last_centroid[0]
+                dy = cy - self.last_centroid[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist > self.max_match_dist:
+                    continue
+            matched.append((pts, conf, cx, cy))
+
+        # separate strong (above --conf) from weak detections
+        strong = [(p, c, x, y) for p, c, x, y in matched
+                  if c >= self.conf_threshold]
+        best_weak = max(matched, key=lambda d: d[1]) if matched else None
+
+        if strong:
+            strong.sort(key=lambda d: d[1], reverse=True)
+            best = strong[0]
+            self.last_centroid = (best[2], best[3])
+            self.last_draw_list = [(p, c) for p, c, x, y in strong]
+            self.last_best_conf = best[1]
+            self.hit_count += 1
+            self.frames_since_hit = 0
+
+            if not self.active and self.hit_count >= self.min_hits:
+                self.active = True
+                if debug:
+                    print(f"  Tracker: ACTIVATED after {self.hit_count} hits")
+
+            if debug:
+                print(f"  Tracker: strong hit conf={best[1]:.3f}, "
+                      f"hits={self.hit_count}, age=0, "
+                      f"fragments={len(strong)}")
+
+        elif best_weak is not None:
+            # weak detection: update centroid for spatial tracking,
+            # but don't count as a hit and don't reset persistence timer
+            self.last_centroid = (best_weak[2], best_weak[3])
+            self.frames_since_hit += 1
+
+            if debug:
+                print(f"  Tracker: weak hit conf={best_weak[1]:.3f}, "
+                      f"age={self.frames_since_hit}")
+        else:
+            self.frames_since_hit += 1
+
+            if debug and self.active:
+                print(f"  Tracker: miss, age={self.frames_since_hit}")
+
+        # deactivate if persistence window expired
+        if self.frames_since_hit > self.persist_frames and self.active:
+            self.active = False
+            if debug:
+                print(f"  Tracker: DEACTIVATED (no strong hit for "
+                      f"{self.frames_since_hit} frames)")
+
+        # reset tracking state after a longer absence so a new core
+        # elsewhere on screen can be picked up fresh
+        if self.frames_since_hit > self.persist_frames + 30:
+            self.last_centroid = None
+            self.last_draw_list = []
+            self.hit_count = 0
+            self.last_best_conf = 0.0
+
+        if self.active and self.last_draw_list:
+            return True, self.last_best_conf, self.last_draw_list
+        else:
+            return False, self.last_best_conf, []
+
+
+def draw_from_tracked(frame, tracked_detections, best_conf, debug=False):
+    """
+    Draw detections selected by the tracker onto a frame.
+    tracked_detections: list of (pts, conf) from DetectionTracker.update().
+    best_conf: strongest raw confidence from the last strong detection.
+    Returns (annotated_frame, n_drawn).
+    """
+    if not tracked_detections:
+        return frame.copy(), 0
+
+    H, W = frame.shape[:2]
+    out = frame.copy()
+    overlay = frame.copy()
+    n_drawn = 0
+
+    for pts, raw_conf in tracked_detections:
+        if len(pts) < 3:
+            continue
+
+        if debug:
+            print(f"  Drawing: conf={raw_conf:.3f}, "
+                  f"pts={len(pts)}, "
+                  f"x=[{pts[:,0].min()}-{pts[:,0].max()}], "
+                  f"y=[{pts[:,1].min()}-{pts[:,1].max()}]")
+
+        cv2.fillPoly(overlay, [pts], POLY_COLOR_BGR)
+        cv2.polylines(out, [pts], isClosed=True, color=POLY_COLOR_BGR, thickness=3)
+
+        cx = int(pts[:, 0].mean())
+        cy = int(pts[:, 1].mean())
+        label = f"core {raw_conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        pad = 4
+        cv2.rectangle(out,
+                      (cx - pad, cy - th - pad * 2),
+                      (cx + tw + pad, cy + pad),
+                      LABEL_BG_BGR, -1)
+        cv2.putText(out, label, (cx, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, TEXT_BGR, 2, cv2.LINE_AA)
+        n_drawn += 1
+
+    blended = np.empty_like(out)
+    cv2.addWeighted(overlay, MASK_ALPHA, out, 1.0 - MASK_ALPHA, 0, blended)
+    return blended, n_drawn
 
 
 def draw_detections(frame, result, conf_threshold, scale_xy=(1.0, 1.0), debug=False):
@@ -241,7 +437,7 @@ def get_overlay_polygons(result, conf_threshold, scale_xy):
     return out
 
 
-def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
+def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug, smoothing=True):
     """
     Second-monitor display mode using an OpenCV window.
     The window is always shown at a sensible landscape size regardless of
@@ -279,12 +475,24 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
         debug_dir.mkdir(exist_ok=True)
         print(f"Debug: saving frames to {debug_dir}/")
 
+    tracker = DetectionTracker(conf_threshold=conf) if smoothing else None
+
+    # when smoothing, use the tracker's lower internal threshold for inference
+    # so the model returns more candidates (e.g. 0.85 when conf=0.90).
+    # the tracker's EMA + hysteresis handles the filtering from there.
+    inf_conf = tracker.internal_conf if tracker is not None else conf
+
     frame_count  = 0
     total_inf_ms = 0.0
     frame_time   = 1.0 / target_fps
 
     print(f"\nRunning. Press Q in the display window to quit.")
     print(f"Conf={conf}  FPS target={target_fps}  Capture {cap_w}x{cap_h}")
+    if tracker is not None:
+        print(f"Smoothing: ON  (internal_conf={inf_conf:.2f}, "
+              f"min_hits={tracker.min_hits}, persist={tracker.persist_frames} frames)")
+    else:
+        print(f"Smoothing: OFF")
 
     with mss.mss() as sct:
         while True:
@@ -292,7 +500,7 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
 
             frame               = capture_frame(sct, left, top, cap_w, cap_h)
             inf_input, sx, sy   = prepare_for_inference(frame)
-            result              = model.predict(inf_input, conf=conf, max_det=MAX_DET,
+            result              = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
                                                 device="cpu", verbose=False)[0]
             inf_ms = (time.perf_counter() - t0) * 1000
 
@@ -302,13 +510,28 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
             n_raw = len(result.boxes) if result.boxes is not None else 0
 
             is_debug_frame = debug and frame_count % 10 == 0
-            annotated, n_drawn = draw_detections(frame, result, conf,
-                                                 scale_xy=(sx, sy),
-                                                 debug=is_debug_frame)
+
+            if tracker is not None:
+                detections = extract_detections(result, inf_conf, scale_xy=(sx, sy))
+                visible, sm_conf, to_draw = tracker.update(detections,
+                                                           debug=is_debug_frame)
+                annotated, n_drawn = draw_from_tracked(frame, to_draw, sm_conf,
+                                                       debug=is_debug_frame)
+            else:
+                # no smoothing - original behavior
+                annotated, n_drawn = draw_detections(frame, result, conf,
+                                                     scale_xy=(sx, sy),
+                                                     debug=is_debug_frame)
 
             if is_debug_frame:
+                extra = ""
+                if tracker is not None:
+                    extra = (f", hits={tracker.hit_count}, "
+                             f"age={tracker.frames_since_hit}, "
+                             f"active={'Y' if tracker.active else 'N'}")
                 print(f"Frame {frame_count}: raw={n_raw}, drawn={n_drawn}, "
-                      f"inf={inf_ms:.0f}ms, avg={total_inf_ms/frame_count:.0f}ms")
+                      f"inf={inf_ms:.0f}ms, avg={total_inf_ms/frame_count:.0f}ms"
+                      f"{extra}")
                 if n_raw == MAX_DET:
                     print(f"  WARNING: hit max_det cap ({MAX_DET}). "
                           f"Raise MAX_DET in code if this happens every frame.")
@@ -333,7 +556,7 @@ def run_monitor2(model, capture_rect, conf, target_fps, ring_type, debug):
         print(f"\nStopped. Average inference: {total_inf_ms/frame_count:.0f}ms/frame")
 
 
-def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
+def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug, smoothing=True):
     """
     Transparent overlay mode using tkinter.
     Background color TRANSPARENT_HEX is made invisible by Windows compositor.
@@ -360,8 +583,14 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
 
     latest_polys = [None]
     latest_n_raw = [0]
+    latest_conf = [0.0]
     running      = [True]
     frame_count  = [0]
+
+    tracker = DetectionTracker(conf_threshold=conf) if smoothing else None
+
+    # when smoothing, use the tracker's lower internal threshold for inference
+    inf_conf = tracker.internal_conf if tracker is not None else conf
 
     debug_dir = None
     if debug:
@@ -376,19 +605,42 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
                 t0     = time.perf_counter()
                 frame             = capture_frame(sct, left, top, w, h)
                 inf_input, sx, sy = prepare_for_inference(frame)
-                result            = model.predict(inf_input, conf=conf, max_det=MAX_DET,
+                result            = model.predict(inf_input, conf=inf_conf, max_det=MAX_DET,
                                                   device="cpu", verbose=False)[0]
 
                 n_raw  = len(result.boxes) if result.boxes is not None else 0
-                polys  = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
-                latest_polys[0]  = polys
-                latest_n_raw[0]  = n_raw
                 frame_count[0]  += 1
                 inf_ms = (time.perf_counter() - t0) * 1000
 
-                if debug and frame_count[0] % 10 == 0:
+                is_debug_frame = debug and frame_count[0] % 10 == 0
+
+                if tracker is not None:
+                    detections = extract_detections(result, inf_conf, scale_xy=(sx, sy))
+                    visible, sm_conf, to_draw = tracker.update(detections,
+                                                               debug=is_debug_frame)
+                    latest_conf[0] = sm_conf
+                    # convert tracked detections to overlay polygon format
+                    polys = []
+                    if visible:
+                        for pts, raw_conf in to_draw:
+                            flat = pts.flatten().tolist()
+                            cx = int(pts[:, 0].mean())
+                            cy = int(pts[:, 1].mean())
+                            polys.append((flat, sm_conf, cx, cy))
+                else:
+                    polys = get_overlay_polygons(result, conf, scale_xy=(sx, sy))
+
+                latest_polys[0]  = polys
+                latest_n_raw[0]  = n_raw
+
+                if is_debug_frame:
+                    extra = ""
+                    if tracker is not None:
+                        extra = (f", hits={tracker.hit_count}, "
+                                 f"age={tracker.frames_since_hit}, "
+                                 f"active={'Y' if tracker.active else 'N'}")
                     print(f"Frame {frame_count[0]}: raw={n_raw}, drawn={len(polys)}, "
-                          f"inf={inf_ms:.0f}ms")
+                          f"inf={inf_ms:.0f}ms{extra}")
 
                 if debug and debug_dir and frame_count[0] % 30 == 0 and len(polys) > 0:
                     annotated, _ = draw_detections(frame, result, conf, scale_xy=(sx, sy))
@@ -427,6 +679,11 @@ def run_overlay(model, capture_rect, conf, target_fps, ring_type, debug):
 
     print(f"\nOverlay active: {w}x{h} at ({left},{top})")
     print(f"Conf={conf}  FPS={target_fps}")
+    if tracker is not None:
+        print(f"Smoothing: ON  (internal_conf={inf_conf:.2f}, "
+              f"min_hits={tracker.min_hits}, persist={tracker.persist_frames} frames)")
+    else:
+        print(f"Smoothing: OFF")
     print(f"Elite Dangerous must be in BORDERLESS WINDOWED mode.")
     print(f"Ctrl+C to quit.")
 
@@ -469,6 +726,11 @@ def main():
     parser.add_argument(
         "--debug", action="store_true",
         help="Print detection details every 10 frames and save annotated frames.",
+    )
+    parser.add_argument(
+        "--no-smoothing", action="store_true",
+        help="Disable EMA confidence smoothing and hysteresis. Shows raw detections "
+             "like the old behavior (bounding boxes blink on/off each frame).",
     )
     args = parser.parse_args()
 
@@ -537,11 +799,18 @@ def main():
               f"y=[{pts[:,1].min()}-{pts[:,1].max()}]")
         print("Coordinates scaled back to frame space.")
 
+    smoothing = not args.no_smoothing
+
     print(f"\nRing type:  {args.ring_type}")
     print(f"Model:      {model_path}")
     print(f"Confidence: {args.conf}")
     print(f"Target FPS: {args.fps}")
     print(f"Display:    {args.display}")
+    print(f"Smoothing:  {'ON (persist + min_hits)' if smoothing else 'OFF (raw detections)'}")
+    if smoothing:
+        int_conf = max(0.10, args.conf * 0.4)
+        print(f"            internal_conf={int_conf:.2f}, "
+              f"min_hits=2, persist=8 frames")
     print()
 
     if args.display == "overlay":
@@ -550,9 +819,11 @@ def main():
             args.display = "monitor2"
 
     if args.display == "overlay":
-        run_overlay(model, capture_rect, args.conf, args.fps, args.ring_type, args.debug)
+        run_overlay(model, capture_rect, args.conf, args.fps, args.ring_type,
+                    args.debug, smoothing=smoothing)
     else:
-        run_monitor2(model, capture_rect, args.conf, args.fps, args.ring_type, args.debug)
+        run_monitor2(model, capture_rect, args.conf, args.fps, args.ring_type,
+                     args.debug, smoothing=smoothing)
 
 
 if __name__ == "__main__":
