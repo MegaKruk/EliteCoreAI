@@ -30,6 +30,8 @@ Usage:
     python companion_app.py --ring-type metal_rich --model-path exports/metal_rich_yolo11_best.pt
     python companion_app.py --ring-type ice --no-smoothing
     python companion_app.py --ring-type ice --device cuda
+    python companion_app.py --ring-type ice --runtime openvino
+    python companion_app.py --ring-type ice --runtime onnxrt
 
 Controls:
     monitor2 mode: press Q in the display window to quit
@@ -860,6 +862,13 @@ def main():
         help="Disable detection smoothing. Shows raw detections "
              "like the old behavior (bounding boxes blink on/off each frame).",
     )
+    parser.add_argument(
+        "--runtime", choices=["pytorch", "openvino", "onnxrt"], default="pytorch",
+        help="Inference runtime (default: pytorch). 'openvino' uses Intel's "
+             "optimized engine (~2-3x faster on Intel CPUs, requires: pip install "
+             "openvino). 'onnxrt' uses ONNX Runtime (requires: pip install "
+             "onnxruntime). Both auto-export from the .pt file if needed.",
+    )
     args = parser.parse_args()
 
     # --- find model ---
@@ -886,34 +895,97 @@ def main():
     print(f"Loading: {model_path}")
     model = YOLO(str(model_path))
 
-    # --- select inference device ---
-    import torch
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = args.device
+    # --- select runtime and export if needed ---
+    if args.runtime == "openvino":
+        try:
+            import openvino
+        except ImportError:
+            print("OpenVINO not installed. Install with: pip install openvino")
+            sys.exit(1)
 
-    use_half = False
-    if device == "cuda":
-        if not torch.cuda.is_available():
-            print("WARNING: CUDA requested but not available. Falling back to CPU.")
-            device = "cpu"
+        # ultralytics exports to a directory named <stem>_openvino_model/
+        ov_dir = model_path.parent / (model_path.stem + "_openvino_model")
+        if ov_dir.exists():
+            print(f"Found existing OpenVINO model: {ov_dir}")
         else:
-            gpu_name = torch.cuda.get_device_name(0)
-            vram_mb = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
-            print(f"GPU: {gpu_name} ({vram_mb}MB VRAM)")
-            # FP16 (half precision) is ~2x faster on modern NVIDIA GPUs and
-            # uses half the VRAM. Safe for inference, no accuracy loss visible.
-            use_half = True
-            print(f"Device: {device} (FP16={'ON' if use_half else 'OFF'})")
-    else:
-        print(f"Device: {device}")
+            print(f"Exporting to OpenVINO format (one-time)...")
+            model.export(format="openvino", half=False)
+            # export puts the directory next to the .pt file
+            if not ov_dir.exists():
+                # ultralytics might put it in the current directory instead
+                alt = Path(model_path.stem + "_openvino_model")
+                if alt.exists():
+                    ov_dir = alt
+                else:
+                    print(f"Export failed: expected {ov_dir} not found")
+                    sys.exit(1)
+            print(f"Exported: {ov_dir}")
 
-    # warmup - first few inferences on GPU are slow due to CUDA kernel JIT
-    # compilation. run several iterations so the main loop doesn't stutter.
+        model = YOLO(str(ov_dir))
+        # OpenVINO manages its own device/threading, ignore --device
+        device = "cpu"
+        use_half = False
+        print(f"Runtime: OpenVINO (Intel optimized CPU inference)")
+
+    elif args.runtime == "onnxrt":
+        try:
+            import onnxruntime
+        except ImportError:
+            print("ONNX Runtime not installed. Install with: pip install onnxruntime")
+            sys.exit(1)
+
+        # look for existing .onnx file
+        onnx_path = model_path.with_suffix(".onnx")
+        if not onnx_path.exists():
+            # try same stem in same directory
+            onnx_path = model_path.parent / (model_path.stem + ".onnx")
+        if not onnx_path.exists():
+            print(f"Exporting to ONNX format (one-time)...")
+            model.export(format="onnx", half=False)
+            onnx_path = model_path.with_suffix(".onnx")
+            if not onnx_path.exists():
+                print(f"Export failed: expected {onnx_path} not found")
+                sys.exit(1)
+            print(f"Exported: {onnx_path}")
+        else:
+            print(f"Found existing ONNX model: {onnx_path}")
+
+        model = YOLO(str(onnx_path))
+        device = "cpu"
+        use_half = False
+        print(f"Runtime: ONNX Runtime")
+        print(f"WARNING: ONNX segmentation via ultralytics may skip NMS.")
+        print(f"If you get 300 garbage detections, this runtime won't work")
+        print(f"for segmentation. Use --runtime openvino instead.")
+
+    else:
+        # pytorch (default)
+        # --- select inference device ---
+        import torch
+        if args.device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            device = args.device
+
+        use_half = False
+        if device == "cuda":
+            if not torch.cuda.is_available():
+                print("WARNING: CUDA requested but not available. Falling back to CPU.")
+                device = "cpu"
+            else:
+                gpu_name = torch.cuda.get_device_name(0)
+                vram_mb = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+                print(f"GPU: {gpu_name} ({vram_mb}MB VRAM)")
+                use_half = True
+                print(f"Device: {device} (FP16={'ON' if use_half else 'OFF'})")
+        else:
+            print(f"Runtime: PyTorch, Device: {device}")
+
+    # warmup - first few inferences are slow due to JIT compilation.
+    # run several iterations so the main loop doesn't stutter.
     print("Warmup inference...", end=" ", flush=True)
     dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-    n_warmup = 5 if device == "cuda" else 1
+    n_warmup = 5 if device == "cuda" else 3
     for i in range(n_warmup):
         warmup = model.predict(dummy, conf=args.conf, max_det=MAX_DET,
                                device=device, half=use_half, verbose=False)[0]
@@ -959,7 +1031,7 @@ def main():
 
     print(f"\nRing type:  {args.ring_type}")
     print(f"Model:      {model_path}")
-    print(f"Device:     {device}" + (f" (FP16)" if use_half else ""))
+    print(f"Runtime:    {args.runtime}" + (f", device={device}" if args.runtime == "pytorch" else ""))
     print(f"Confidence: {args.conf}")
     print(f"Target FPS: {args.fps}")
     print(f"Display:    {args.display}")
