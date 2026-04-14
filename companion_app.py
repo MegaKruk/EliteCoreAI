@@ -72,6 +72,37 @@ MASK_ALPHA      = 0.30
 MAX_DET = 50
 
 
+def conf_to_color_bgr(conf):
+    """
+    Map a confidence value to a BGR color.
+    <= 0.7 = red, 0.85 = orange, 1.0 = green.
+    """
+    conf = max(0.0, min(1.0, conf))
+    if conf <= 0.7:
+        # pure red
+        return (0, 0, 255)
+    elif conf < 0.85:
+        # red (0,0,255) -> orange (0,165,255)
+        t = (conf - 0.7) / 0.15
+        return (0, int(165 * t), 255)
+    else:
+        # orange (0,165,255) -> green (0,255,0)
+        t = (conf - 0.85) / 0.15
+        return (0, 165 + int(90 * t), 255 - int(255 * t))
+
+
+def conf_to_color_hex(conf):
+    """Same as conf_to_color_bgr but returns a hex string for tkinter."""
+    b, g, r = conf_to_color_bgr(conf)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def conf_to_label_bg_bgr(conf):
+    """Darker version of the confidence color for label backgrounds."""
+    b, g, r = conf_to_color_bgr(conf)
+    return (b // 2, g // 2, r // 2)
+
+
 def find_model(ring_type, models_dir):
     """
     Look for the best trained weights for a ring type.
@@ -333,11 +364,12 @@ class DetectionTracker:
             return False, self.last_best_conf, []
 
 
-def draw_from_tracked(frame, tracked_detections, best_conf, debug=False):
+def draw_from_tracked(frame, tracked_detections, best_conf, opacity=0.30, debug=False):
     """
     Draw detections selected by the tracker onto a frame.
     tracked_detections: list of (pts, conf) from DetectionTracker.update().
     best_conf: strongest raw confidence from the last strong detection.
+    opacity: fill opacity (0.0-1.0). Outline is always fully visible.
     Returns (annotated_frame, n_drawn).
     """
     if not tracked_detections:
@@ -352,14 +384,17 @@ def draw_from_tracked(frame, tracked_detections, best_conf, debug=False):
         if len(pts) < 3:
             continue
 
+        color = conf_to_color_bgr(raw_conf)
+        label_bg = conf_to_label_bg_bgr(raw_conf)
+
         if debug:
             print(f"  Drawing: conf={raw_conf:.3f}, "
                   f"pts={len(pts)}, "
                   f"x=[{pts[:,0].min()}-{pts[:,0].max()}], "
                   f"y=[{pts[:,1].min()}-{pts[:,1].max()}]")
 
-        cv2.fillPoly(overlay, [pts], POLY_COLOR_BGR)
-        cv2.polylines(out, [pts], isClosed=True, color=POLY_COLOR_BGR, thickness=3)
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.polylines(out, [pts], isClosed=True, color=color, thickness=3)
 
         cx = int(pts[:, 0].mean())
         cy = int(pts[:, 1].mean())
@@ -369,23 +404,25 @@ def draw_from_tracked(frame, tracked_detections, best_conf, debug=False):
         cv2.rectangle(out,
                       (cx - pad, cy - th - pad * 2),
                       (cx + tw + pad, cy + pad),
-                      LABEL_BG_BGR, -1)
+                      label_bg, -1)
         cv2.putText(out, label, (cx, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, TEXT_BGR, 2, cv2.LINE_AA)
         n_drawn += 1
 
     blended = np.empty_like(out)
-    cv2.addWeighted(overlay, MASK_ALPHA, out, 1.0 - MASK_ALPHA, 0, blended)
+    cv2.addWeighted(overlay, opacity, out, 1.0 - opacity, 0, blended)
     return blended, n_drawn
 
 
-def draw_detections(frame, result, conf_threshold, scale_xy=(1.0, 1.0), debug=False):
+def draw_detections(frame, result, conf_threshold, scale_xy=(1.0, 1.0),
+                    opacity=0.30, debug=False):
     """
     Draw segmentation polygon masks and confidence labels on a copy of frame.
 
     scale_xy: (scale_x, scale_y) to map polygon coordinates from inference
               space (640x640) back to the original frame dimensions. Pass the
               values returned by prepare_for_inference().
+    opacity: fill opacity (0.0-1.0). Outline is always fully visible.
 
     Returns (annotated_frame, n_drawn).
     """
@@ -416,14 +453,17 @@ def draw_detections(frame, result, conf_threshold, scale_xy=(1.0, 1.0), debug=Fa
             # scale from 640x640 inference space back to frame space
             pts = (pts * np.array([[sx, sy]])).astype(np.int32)
 
+            color = conf_to_color_bgr(conf)
+            label_bg = conf_to_label_bg_bgr(conf)
+
             if debug:
                 print(f"  Detection {i}: conf={conf:.3f}, pts={len(pts)}, "
                       f"x=[{pts[:,0].min()}-{pts[:,0].max()}], "
                       f"y=[{pts[:,1].min()}-{pts[:,1].max()}], "
                       f"frame={W}x{H}")
 
-            cv2.fillPoly(overlay, [pts], POLY_COLOR_BGR)
-            cv2.polylines(out, [pts], isClosed=True, color=POLY_COLOR_BGR, thickness=3)
+            cv2.fillPoly(overlay, [pts], color)
+            cv2.polylines(out, [pts], isClosed=True, color=color, thickness=3)
 
             cx    = int(pts[:, 0].mean())
             cy    = int(pts[:, 1].mean())
@@ -433,14 +473,14 @@ def draw_detections(frame, result, conf_threshold, scale_xy=(1.0, 1.0), debug=Fa
             cv2.rectangle(out,
                           (cx - pad, cy - th - pad * 2),
                           (cx + tw + pad, cy + pad),
-                          LABEL_BG_BGR, -1)
+                          label_bg, -1)
             cv2.putText(out, label, (cx, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, TEXT_BGR, 2, cv2.LINE_AA)
             n_drawn += 1
 
     # blend mask fill with outlines - write to a separate buffer (not in-place)
     blended = np.empty_like(out)
-    cv2.addWeighted(overlay, MASK_ALPHA, out, 1.0 - MASK_ALPHA, 0, blended)
+    cv2.addWeighted(overlay, opacity, out, 1.0 - opacity, 0, blended)
     return blended, n_drawn
 
 
@@ -479,7 +519,7 @@ def get_overlay_polygons(result, conf_threshold, scale_xy):
 
 def run_monitor2(model, capture_rect, crop_offset, imgsz,
                  conf, target_fps, ring_type, debug,
-                 smoothing=True, device="cpu", use_half=False):
+                 smoothing=True, device="cpu", use_half=False, opacity=0.30):
     """
     Second-monitor display mode using an OpenCV window.
     The window is always shown at a sensible landscape size regardless of
@@ -576,11 +616,13 @@ def run_monitor2(model, capture_rect, crop_offset, imgsz,
                 visible, sm_conf, to_draw = tracker.update(detections,
                                                            debug=is_debug_frame)
                 annotated, n_drawn = draw_from_tracked(frame, to_draw, sm_conf,
+                                                       opacity=opacity,
                                                        debug=is_debug_frame)
             else:
                 # no smoothing - original behavior
                 annotated, n_drawn = draw_detections(frame, result, conf,
                                                      scale_xy=(sx, sy),
+                                                     opacity=opacity,
                                                      debug=is_debug_frame)
 
             if is_debug_frame:
@@ -628,7 +670,7 @@ def run_monitor2(model, capture_rect, crop_offset, imgsz,
 
 def run_overlay(model, window_rect, capture_rect, crop_offset, imgsz,
                 conf, target_fps, ring_type, debug,
-                smoothing=True, device="cpu", use_half=False):
+                smoothing=True, device="cpu", use_half=False, opacity=0.30):
     """
     Transparent overlay mode using tkinter with a 3-thread pipeline:
       Thread 1 (capture):   grabs screen frames as fast as possible
@@ -784,6 +826,18 @@ def run_overlay(model, window_rect, capture_rect, crop_offset, imgsz,
     # inference results appear on the next canvas update after they're ready.
     CANVAS_INTERVAL_MS = 50  # 20fps
 
+    # tkinter doesn't support real alpha. map opacity to a stipple pattern.
+    if opacity < 0.15:
+        stipple = ""
+    elif opacity < 0.35:
+        stipple = "gray12"
+    elif opacity < 0.60:
+        stipple = "gray25"
+    elif opacity < 0.85:
+        stipple = "gray50"
+    else:
+        stipple = "gray75"
+
     def update_canvas():
         canvas.delete("all")
 
@@ -796,14 +850,15 @@ def run_overlay(model, window_rect, capture_rect, crop_offset, imgsz,
 
         if polys:
             for flat, conf_val, cx, cy in polys:
-                canvas.create_polygon(flat, outline=POLY_COLOR_HEX,
-                                      fill=POLY_COLOR_HEX,
-                                      stipple="gray25", width=3)
+                color_hex = conf_to_color_hex(conf_val)
+                canvas.create_polygon(flat, outline=color_hex,
+                                      fill=color_hex,
+                                      stipple=stipple, width=3)
                 label = f"core {conf_val:.2f}"
                 canvas.create_text(cx + 1, cy + 1, text=label,
                                    fill="#002200", font=("Consolas", 12, "bold"))
                 canvas.create_text(cx, cy, text=label,
-                                   fill=POLY_COLOR_HEX, font=("Consolas", 12, "bold"))
+                                   fill=color_hex, font=("Consolas", 12, "bold"))
 
         if running[0]:
             root.after(CANVAS_INTERVAL_MS, update_canvas)
@@ -880,6 +935,11 @@ def main():
         help="Shift the crop area center up (negative) or down (positive) by this "
              "many pixels. Use with --crop-area to avoid the cockpit at the bottom. "
              "Example: --y-offset -150 moves the crop 150px up.",
+    )
+    parser.add_argument(
+        "--opacity", type=float, default=0.30,
+        help="Opacity of the detection polygon fill (0.0 = fully transparent, "
+             "1.0 = fully opaque). Default: 0.30. The outline is always fully visible.",
     )
     parser.add_argument(
         "--fps", type=int, default=30,
@@ -1113,6 +1173,7 @@ def main():
         yo = f", y-offset={args.y_offset}" if args.y_offset != 0 else ""
         print(f"Crop area:  {args.crop_area}{yo}")
     print(f"Confidence: {args.conf}")
+    print(f"Opacity:    {args.opacity}")
     print(f"Display:    {args.display}")
     print(f"Smoothing:  {'ON (persist + min_hits)' if smoothing else 'OFF (raw detections)'}")
     if smoothing:
@@ -1129,11 +1190,13 @@ def main():
     if args.display == "overlay":
         run_overlay(model, window_rect, capture_rect, crop_offset, imgsz,
                     args.conf, args.fps, args.ring_type, args.debug,
-                    smoothing=smoothing, device=device, use_half=use_half)
+                    smoothing=smoothing, device=device, use_half=use_half,
+                    opacity=args.opacity)
     else:
         run_monitor2(model, capture_rect, crop_offset, imgsz,
                      args.conf, args.fps, args.ring_type, args.debug,
-                     smoothing=smoothing, device=device, use_half=use_half)
+                     smoothing=smoothing, device=device, use_half=use_half,
+                     opacity=args.opacity)
 
 
 if __name__ == "__main__":
