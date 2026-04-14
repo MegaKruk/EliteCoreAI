@@ -876,6 +876,12 @@ def main():
              "A rectangle is drawn on the overlay/monitor2 showing the active area.",
     )
     parser.add_argument(
+        "--y-offset", type=int, default=0,
+        help="Shift the crop area center up (negative) or down (positive) by this "
+             "many pixels. Use with --crop-area to avoid the cockpit at the bottom. "
+             "Example: --y-offset -150 moves the crop 150px up.",
+    )
+    parser.add_argument(
         "--fps", type=int, default=30,
         help="Target FPS (default: 30). GPU can sustain 30+, CPU tops out at 4-6.",
     )
@@ -1061,13 +1067,18 @@ def main():
             print(f"Crop area {crop_w}x{crop_h} is larger than window {ww}x{wh}")
             sys.exit(1)
 
-        # center the crop rectangle in the window
+        # center the crop rectangle in the window, then apply y-offset
         cl = wl + (ww - crop_w) // 2
-        ct = wt + (wh - crop_h) // 2
+        ct = wt + (wh - crop_h) // 2 + args.y_offset
+
+        # clamp so the crop doesn't go outside the window
+        ct = max(wt, min(ct, wt + wh - crop_h))
+
         capture_rect = (cl, ct, crop_w, crop_h)
         # offset from window top-left to crop top-left (for overlay polygon positioning)
-        crop_offset = ((ww - crop_w) // 2, (wh - crop_h) // 2)
-        print(f"Crop area: {crop_w}x{crop_h} centered at offset ({crop_offset[0]},{crop_offset[1]})")
+        crop_offset = (cl - wl, ct - wt)
+        print(f"Crop area: {crop_w}x{crop_h} at offset ({crop_offset[0]},{crop_offset[1]})"
+              + (f" (y-offset={args.y_offset})" if args.y_offset != 0 else ""))
     else:
         capture_rect = window_rect
 
@@ -1099,7 +1110,8 @@ def main():
     print(f"Runtime:    {args.runtime}" + (f", device={device}" if args.runtime == "pytorch" else ""))
     print(f"Img size:   {imgsz}x{imgsz}")
     if args.crop_area:
-        print(f"Crop area:  {args.crop_area} (centered)")
+        yo = f", y-offset={args.y_offset}" if args.y_offset != 0 else ""
+        print(f"Crop area:  {args.crop_area}{yo}")
     print(f"Confidence: {args.conf}")
     print(f"Display:    {args.display}")
     print(f"Smoothing:  {'ON (persist + min_hits)' if smoothing else 'OFF (raw detections)'}")
