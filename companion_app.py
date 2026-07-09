@@ -454,6 +454,7 @@ class SharedState:
         self.draw      = []      # [(poly Nx2 float32 in frame space, conf)]
         self.n_raw     = 0
         self.inf_ms    = 0.0
+        self.inf_count = 0       # completed inferences, drives the heartbeat
         self.rect         = rect  # full game-window rect (for the overlay)
         self.rect_changed = False
         self.running   = True
@@ -472,13 +473,14 @@ class SharedState:
 
     def set_result(self, draw, n_raw, inf_ms):
         with self.lock:
-            self.draw   = draw
-            self.n_raw  = n_raw
-            self.inf_ms = inf_ms
+            self.draw       = draw
+            self.n_raw      = n_raw
+            self.inf_ms     = inf_ms
+            self.inf_count += 1
 
     def get_result(self):
         with self.lock:
-            return list(self.draw), self.n_raw, self.inf_ms
+            return list(self.draw), self.n_raw, self.inf_ms, self.inf_count
 
     def set_rect(self, rect):
         with self.lock:
@@ -642,7 +644,7 @@ def run_monitor2(state, args, ring_label, engine_name, cap_w, cap_h):
     while state.running:
         t0 = time.perf_counter()
         frame, _ = state.get_frame()
-        draw, n, inf_ms = state.get_result()
+        draw, n, inf_ms, _ticks = state.get_result()
 
         if frame is None:
             canvas = np.zeros((360, 640, 3), dtype=np.uint8)
@@ -651,7 +653,10 @@ def run_monitor2(state, args, ring_label, engine_name, cap_w, cap_h):
         else:
             canvas = draw_on_frame(frame, draw)
 
-        hud = f"{ring_label}  {n} core(s)  {inf_ms:.0f}ms  {engine_name}"
+        best = max((cf for _, cf in draw), default=0.0)
+        hud = (f"{ring_label}  {n} core(s)"
+               + (f"  best {best:.2f}" if draw else "")
+               + f"  {inf_ms:.0f}ms  {engine_name}  conf>={args.conf:.2f}")
         cv2.putText(canvas, hud, (12, 30), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (240, 240, 240), 2, cv2.LINE_AA)
         cv2.imshow(win, canvas)
@@ -706,10 +711,34 @@ def run_overlay(state, args, ring_label, engine_name):
         if make_clickthrough(root):
             print("Overlay is click-through: mouse and keys go to the game.")
 
-    # polygons are in capture-region coordinates; the canvas spans the full
-    # window, so shift by the region's offset inside the window when drawing
-    _, off_x, off_y = compute_capture(state.rect, args.crop, args.y_offset)
-    off = [off_x, off_y]
+    # capture region inside the window: polygons arrive in region coordinates
+    # while the canvas spans the full window, so drawing shifts by the region
+    # offset. region = [rel_x, rel_y, width, height], refreshed if the game
+    # window moves or resizes.
+    cap0, off_x, off_y = compute_capture(state.rect, args.crop, args.y_offset)
+    region = [off_x, off_y, cap0[2], cap0[3]]
+
+    def draw_region_box(draw_list, ticks):
+        """Mark the model's field of view: dashed outline plus corner
+        brackets. Bracket color follows the best current detection (dim
+        gray-green while the region is empty), and a small heartbeat square
+        alternates on every completed inference - if it freezes, the
+        inference pipeline has stalled."""
+        rx, ry, rw, rh = region
+        if draw_list:
+            _, color = conf_to_color(max(cf for _, cf in draw_list))
+        else:
+            color = "#3f523f"
+        canvas.create_rectangle(rx, ry, rx + rw, ry + rh,
+                                outline="#2c3a2c", width=1, dash=(4, 8))
+        arm = max(16, min(34, rw // 12))
+        for cx, cy, dx, dy in ((rx, ry, 1, 1), (rx + rw, ry, -1, 1),
+                               (rx, ry + rh, 1, -1), (rx + rw, ry + rh, -1, -1)):
+            canvas.create_line(cx, cy, cx + dx * arm, cy, fill=color, width=3)
+            canvas.create_line(cx, cy, cx, cy + dy * arm, fill=color, width=3)
+        beat = "#30ff70" if ticks % 2 == 0 else "#1a5c33"
+        canvas.create_rectangle(rx + 8, ry + 8, rx + 16, ry + 16,
+                                fill=beat, outline="")
 
     def tick():
         if not state.running:
@@ -720,15 +749,20 @@ def run_overlay(state, args, ring_label, engine_name):
             l2, t2, w2, h2 = rect2
             root.geometry(f"{w2}x{h2}+{l2}+{t2}")
             canvas.config(width=w2, height=h2)
-            _, off[0], off[1] = compute_capture(rect2, args.crop, args.y_offset)
+            cap2, ox, oy = compute_capture(rect2, args.crop, args.y_offset)
+            region[:] = [ox, oy, cap2[2], cap2[3]]
 
         canvas.delete("all")
-        draw, n, inf_ms = state.get_result()
+        draw, n, inf_ms, ticks = state.get_result()
+
+        if not args.no_region_box:
+            draw_region_box(draw, ticks)
+
         for poly, cf in draw:
             _, hexc = conf_to_color(cf)
             pts = poly.copy()
-            pts[:, 0] += off[0]
-            pts[:, 1] += off[1]
+            pts[:, 0] += region[0]
+            pts[:, 1] += region[1]
             flat = pts.astype(int).flatten().tolist()
             # stipple fill fakes translucency - tkinter has no real alpha,
             # gray25 paints every 4th pixel for a ~25% wash
@@ -742,10 +776,14 @@ def run_overlay(state, args, ring_label, engine_name):
             canvas.create_text(cx, cy, text=label, fill=hexc,
                                font=("Consolas", 12, "bold"))
 
-        hud = f"{ring_label} {n} core(s) {inf_ms:.0f}ms {engine_name}"
-        canvas.create_text(11, 13, text=hud, anchor="w", fill="#102010",
+        best = max((cf for _, cf in draw), default=0.0)
+        hud = (f"{ring_label}  {n} core(s)"
+               + (f"  best {best:.2f}" if draw else "")
+               + f"  |  {inf_ms:.0f}ms {engine_name}  conf>={args.conf:.2f}")
+        hx, hy = region[0] + 22, region[1] + 12
+        canvas.create_text(hx + 1, hy + 1, text=hud, anchor="w", fill="#102010",
                            font=("Consolas", 10, "bold"))
-        canvas.create_text(10, 12, text=hud, anchor="w", fill="#30ff70",
+        canvas.create_text(hx, hy, text=hud, anchor="w", fill="#30ff70",
                            font=("Consolas", 10, "bold"))
         root.after(int(1000 / UI_FPS), tick)
 
@@ -890,6 +928,9 @@ def main():
         help="Miss frames to keep drawing the last polygons for (default 8)")
     parser.add_argument("--no-clickthrough", action="store_true",
         help="Overlay catches the mouse instead of passing it to the game")
+    parser.add_argument("--no-region-box", action="store_true",
+        help="Hide the capture-region marker (corner brackets, dashed "
+             "outline, status line, heartbeat) in overlay mode")
     parser.add_argument("--debug", action="store_true",
         help="Print detection stats every 10 frames and save annotated "
              "frames to debug_frames/ (these make great hard negatives "
