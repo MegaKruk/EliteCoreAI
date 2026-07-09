@@ -1,10 +1,16 @@
-# Additional packages needed for companion_app.py
-# The core ML packages (ultralytics, opencv-python, onnxruntime-gpu) are
-# already installed from requirements.txt used during training.
+# Companion app dependencies. The training packages (ultralytics, torch,
+# opencv-python, numpy) are already installed from requirements.txt.
 #
-# Install these with:
+# Install with:
 #   pip install -r companion_requirements.txt
 
-mss>=9.0.1           # fast screen capture on Windows
-pygetwindow>=0.0.9   # find and locate the Elite Dangerous window
-screeninfo>=0.8.1    # detect second monitor position for auto window placement
+dxcam>=0.0.5         # DXGI screen capture, ~5-10ms/frame (mss fallback built in)
+mss>=9.0.1           # capture fallback when dxcam is unavailable
+pygetwindow>=0.0.9   # locate the Elite Dangerous window
+screeninfo>=0.8.1    # place the monitor2 window automatically
+
+# Optional - only needed for --runtime onnxrt (usually 1.5-2x faster on CPU):
+onnxruntime>=1.17
+
+# Optional - only needed for --runtime openvino (Intel-optimized provider):
+# onnxruntime-openvino
