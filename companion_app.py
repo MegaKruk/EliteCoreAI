@@ -7,7 +7,9 @@ core asteroid polygons with confidence scores.
 
 Display modes:
   monitor2  - window on your second monitor showing the game feed with
-              detections drawn on it (always works, use this first)
+              detections drawn on it (always works, use this first); when
+              the game window is found, a polygon-free region HUD is also
+              drawn over the game itself
   overlay   - transparent click-through window drawn directly over the game
               (requires the game to run in BORDERLESS WINDOWED mode)
 
@@ -634,38 +636,27 @@ def place_on_monitor2(win_name, cap_w, cap_h):
         print("Install for auto placement: pip install screeninfo")
 
 
-def run_monitor2(state, args, ring_label, engine_name, cap_w, cap_h):
-    win = f"Core Mining AI [{ring_label}]"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    place_on_monitor2(win, cap_w, cap_h)
 
-    period = 1.0 / UI_FPS
-    print("Running. Press Q or ESC in the display window to quit.")
-    while state.running:
-        t0 = time.perf_counter()
-        frame, _ = state.get_frame()
-        draw, n, inf_ms, _ticks = state.get_result()
-
-        if frame is None:
-            canvas = np.zeros((360, 640, 3), dtype=np.uint8)
-            cv2.putText(canvas, "waiting for capture...", (30, 180),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-        else:
-            canvas = draw_on_frame(frame, draw)
-
-        best = max((cf for _, cf in draw), default=0.0)
-        hud = (f"{ring_label}  {n} core(s)"
-               + (f"  best {best:.2f}" if draw else "")
-               + f"  {inf_ms:.0f}ms  {engine_name}  conf>={args.conf:.2f}")
-        cv2.putText(canvas, hud, (12, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (240, 240, 240), 2, cv2.LINE_AA)
-        cv2.imshow(win, canvas)
-
-        wait_ms = max(1, int((period - (time.perf_counter() - t0)) * 1000))
-        k = cv2.waitKey(wait_ms) & 0xFF
-        if k in (ord("q"), 27):
-            state.running = False
-    cv2.destroyAllWindows()
+def draw_hud_on_frame(img, dets, hud, ticks):
+    """Burn the region HUD into a monitor2 frame: corner brackets on the
+    frame border (the whole frame IS the capture region there), heartbeat
+    square, status line. Mirrors the in-game overlay HUD."""
+    H, W = img.shape[:2]
+    if dets:
+        color, _ = conf_to_color(max(cf for _, cf in dets))
+    else:
+        color = (63, 82, 63)
+    arm = max(16, min(34, W // 12))
+    for cx, cy, dx, dy in ((0, 0, 1, 1), (W - 1, 0, -1, 1),
+                           (0, H - 1, 1, -1), (W - 1, H - 1, -1, -1)):
+        cv2.line(img, (cx, cy), (cx + dx * arm, cy), color, 3)
+        cv2.line(img, (cx, cy), (cx, cy + dy * arm), color, 3)
+    beat = (112, 255, 48) if ticks % 2 == 0 else (51, 92, 26)
+    cv2.rectangle(img, (10, 12), (20, 22), beat, -1)
+    cv2.putText(img, hud, (29, 23), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (16, 32, 16), 3, cv2.LINE_AA)
+    cv2.putText(img, hud, (28, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (112, 255, 48), 2, cv2.LINE_AA)
 
 
 def make_clickthrough(root):
@@ -688,42 +679,71 @@ def make_clickthrough(root):
         return False
 
 
-def run_overlay(state, args, ring_label, engine_name):
+
+def run_ui(state, args, ring_label, engine_name, cap_w, cap_h, game_found):
+    """
+    Single main-thread UI loop driven by tkinter's after() timer at UI_FPS.
+
+    overlay mode:  transparent click-through window over the game with
+                   detection polygons plus the region HUD.
+    monitor2 mode: cv2 window on the second monitor with the annotated feed
+                   and the same HUD burned in; when the game window was
+                   found, a polygon-free region HUD is ALSO drawn over the
+                   game itself, so you can see where the model is looking
+                   without glancing away. Hide it with --no-region-box.
+
+    cv2.imshow runs inside the tk tick: both toolkits are only reliable on
+    the main thread on Windows, and one shared timer keeps them in sync.
+    """
     import tkinter as tk
 
-    l, t, w, h = state.rect
-    root = tk.Tk()
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.attributes("-transparentcolor", TRANSPARENT_HEX)
-    if args.opacity < 1.0:
-        # global window alpha: only the drawn polygons and text are visible,
-        # so this dims the overlay graphics without touching the game
-        root.attributes("-alpha", args.opacity)
-    root.configure(bg=TRANSPARENT_HEX)
-    root.geometry(f"{w}x{h}+{l}+{t}")
+    show_cv2     = args.display == "monitor2"
+    show_polys   = args.display == "overlay"
+    show_overlay = game_found and (show_polys or not args.no_region_box)
 
-    canvas = tk.Canvas(root, width=w, height=h, bg=TRANSPARENT_HEX,
-                       highlightthickness=0)
-    canvas.pack(fill="both", expand=True)
-
-    if not args.no_clickthrough:
-        if make_clickthrough(root):
+    root   = tk.Tk()
+    canvas = None
+    if show_overlay:
+        l, t, w, h = state.rect
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        root.attributes("-transparentcolor", TRANSPARENT_HEX)
+        if args.opacity < 1.0:
+            # only the drawn graphics are visible, so this dims the overlay
+            # elements without touching the game underneath
+            root.attributes("-alpha", args.opacity)
+        root.configure(bg=TRANSPARENT_HEX)
+        root.geometry(f"{w}x{h}+{l}+{t}")
+        canvas = tk.Canvas(root, width=w, height=h, bg=TRANSPARENT_HEX,
+                           highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        if not args.no_clickthrough and make_clickthrough(root):
             print("Overlay is click-through: mouse and keys go to the game.")
+        if show_polys:
+            print(f"Overlay active: {w}x{h} at ({l},{t})")
+            print("Elite Dangerous must be in BORDERLESS WINDOWED mode.")
+        else:
+            print("In-game region HUD active over the game window "
+                  "(hide with --no-region-box).")
+    else:
+        root.withdraw()
 
-    # capture region inside the window: polygons arrive in region coordinates
-    # while the canvas spans the full window, so drawing shifts by the region
-    # offset. region = [rel_x, rel_y, width, height], refreshed if the game
-    # window moves or resizes.
     cap0, off_x, off_y = compute_capture(state.rect, args.crop, args.y_offset)
     region = [off_x, off_y, cap0[2], cap0[3]]
 
+    win = None
+    if show_cv2:
+        win = f"Core Mining AI [{ring_label}]"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        place_on_monitor2(win, cap_w, cap_h)
+        print("Press Q or ESC in the monitor2 window to quit.")
+    print("Ctrl+C in this terminal also quits.")
+
     def draw_region_box(draw_list, ticks):
-        """Mark the model's field of view: dashed outline plus corner
-        brackets. Bracket color follows the best current detection (dim
-        gray-green while the region is empty), and a small heartbeat square
-        alternates on every completed inference - if it freezes, the
-        inference pipeline has stalled."""
+        """Corner brackets + dashed outline marking the model's field of
+        view. Bracket color follows the best current detection (dim
+        gray-green while empty); the heartbeat square alternates on every
+        completed inference - if it freezes, the pipeline has stalled."""
         rx, ry, rw, rh = region
         if draw_list:
             _, color = conf_to_color(max(cf for _, cf in draw_list))
@@ -746,50 +766,72 @@ def run_overlay(state, args, ring_label, engine_name):
             return
         changed, rect2 = state.pop_rect_change()
         if changed:
-            l2, t2, w2, h2 = rect2
-            root.geometry(f"{w2}x{h2}+{l2}+{t2}")
-            canvas.config(width=w2, height=h2)
             cap2, ox, oy = compute_capture(rect2, args.crop, args.y_offset)
             region[:] = [ox, oy, cap2[2], cap2[3]]
+            if show_overlay:
+                l2, t2, w2, h2 = rect2
+                root.geometry(f"{w2}x{h2}+{l2}+{t2}")
+                canvas.config(width=w2, height=h2)
 
-        canvas.delete("all")
         draw, n, inf_ms, ticks = state.get_result()
-
-        if not args.no_region_box:
-            draw_region_box(draw, ticks)
-
-        for poly, cf in draw:
-            _, hexc = conf_to_color(cf)
-            pts = poly.copy()
-            pts[:, 0] += region[0]
-            pts[:, 1] += region[1]
-            flat = pts.astype(int).flatten().tolist()
-            # stipple fill fakes translucency - tkinter has no real alpha,
-            # gray25 paints every 4th pixel for a ~25% wash
-            canvas.create_polygon(flat, outline=hexc, fill=hexc,
-                                  stipple="gray25", width=3)
-            cx = int(pts[:, 0].mean())
-            cy = int(pts[:, 1].mean())
-            label = f"core {cf:.2f}"
-            canvas.create_text(cx + 1, cy + 1, text=label, fill="#101010",
-                               font=("Consolas", 12, "bold"))
-            canvas.create_text(cx, cy, text=label, fill=hexc,
-                               font=("Consolas", 12, "bold"))
-
         best = max((cf for _, cf in draw), default=0.0)
         hud = (f"{ring_label}  {n} core(s)"
                + (f"  best {best:.2f}" if draw else "")
                + f"  |  {inf_ms:.0f}ms {engine_name}  conf>={args.conf:.2f}")
-        hx, hy = region[0] + 22, region[1] + 12
-        canvas.create_text(hx + 1, hy + 1, text=hud, anchor="w", fill="#102010",
-                           font=("Consolas", 10, "bold"))
-        canvas.create_text(hx, hy, text=hud, anchor="w", fill="#30ff70",
-                           font=("Consolas", 10, "bold"))
+
+        if show_overlay:
+            canvas.delete("all")
+            if not args.no_region_box:
+                draw_region_box(draw, ticks)
+            if show_polys:
+                for poly, cf in draw:
+                    _, hexc = conf_to_color(cf)
+                    pts = poly.copy()
+                    pts[:, 0] += region[0]
+                    pts[:, 1] += region[1]
+                    flat = pts.astype(int).flatten().tolist()
+                    # stipple fill fakes translucency - tkinter has no real
+                    # alpha, gray25 paints every 4th pixel for a ~25% wash
+                    canvas.create_polygon(flat, outline=hexc, fill=hexc,
+                                          stipple="gray25", width=3)
+                    cx = int(pts[:, 0].mean())
+                    cy = int(pts[:, 1].mean())
+                    label = f"core {cf:.2f}"
+                    canvas.create_text(cx + 1, cy + 1, text=label,
+                                       fill="#101010",
+                                       font=("Consolas", 12, "bold"))
+                    canvas.create_text(cx, cy, text=label, fill=hexc,
+                                       font=("Consolas", 12, "bold"))
+            hx, hy = region[0] + 22, region[1] + 12
+            canvas.create_text(hx + 1, hy + 1, text=hud, anchor="w",
+                               fill="#102010", font=("Consolas", 10, "bold"))
+            canvas.create_text(hx, hy, text=hud, anchor="w", fill="#30ff70",
+                               font=("Consolas", 10, "bold"))
+
+        if show_cv2:
+            frame, _ = state.get_frame()
+            if frame is None:
+                img = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(img, "waiting for capture...", (30, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            else:
+                img = draw_on_frame(frame, draw)
+            draw_hud_on_frame(img, draw, hud, ticks)
+            cv2.imshow(win, img)
+            k = cv2.waitKey(1) & 0xFF
+            if k in (ord("q"), 27):
+                state.running = False
+            try:
+                if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                    state.running = False
+            except cv2.error:
+                state.running = False
+
         root.after(int(1000 / UI_FPS), tick)
 
     def reassert_topmost():
         # some fullscreen-ish games steal z-order; re-assert every 2s
-        if not state.running:
+        if not state.running or not show_overlay:
             return
         try:
             root.attributes("-topmost", True)
@@ -804,14 +846,13 @@ def run_overlay(state, args, ring_label, engine_name):
     root.bind("<Escape>", on_close)
     signal.signal(signal.SIGINT, lambda *_: on_close())
 
-    print(f"Overlay active: {w}x{h} at ({l},{t})")
-    print("Elite Dangerous must be in BORDERLESS WINDOWED mode.")
-    print("Ctrl+C in this terminal to quit.")
-
     root.after(100, tick)
-    root.after(2000, reassert_topmost)
+    if show_overlay:
+        root.after(2000, reassert_topmost)
     root.mainloop()
     state.running = False
+    if win is not None:
+        cv2.destroyAllWindows()
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +971,8 @@ def main():
         help="Overlay catches the mouse instead of passing it to the game")
     parser.add_argument("--no-region-box", action="store_true",
         help="Hide the capture-region marker (corner brackets, dashed "
-             "outline, status line, heartbeat) in overlay mode")
+             "outline, status line, heartbeat) over the game window and "
+             "in the monitor2 feed")
     parser.add_argument("--debug", action="store_true",
         help="Print detection stats every 10 frames and save annotated "
              "frames to debug_frames/ (these make great hard negatives "
@@ -985,6 +1027,7 @@ def main():
             print("Elite Dangerous window not found "
                   "(title must contain 'elite' and 'dangerous').")
             print("Falling back to primary monitor capture.")
+    game_found = game_rect is not None
     if game_rect is None:
         game_rect = get_primary_monitor_rect()
         if args.display == "overlay":
@@ -1021,11 +1064,8 @@ def main():
     t_inf.start()
 
     try:
-        if args.display == "overlay":
-            run_overlay(state, args, ring_label, engine.name)
-        else:
-            run_monitor2(state, args, ring_label, engine.name,
-                         cap_rect[2], cap_rect[3])
+        run_ui(state, args, ring_label, engine.name,
+               cap_rect[2], cap_rect[3], game_found)
     except KeyboardInterrupt:
         pass
     finally:
